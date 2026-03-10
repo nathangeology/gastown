@@ -36,6 +36,8 @@ const (
 	// AgentOmp is Oh My Pi (OMP) — Pi fork with hook-based lifecycle.
 	// Inspired by github.com/ProbabilityEngineer/pi-mono gastown integration.
 	AgentOmp AgentPreset = "omp"
+	// AgentKiro is Kiro CLI.
+	AgentKiro AgentPreset = "kiro"
 )
 
 // AgentPresetInfo contains the configuration details for an agent preset.
@@ -220,7 +222,7 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		Command:             "codex",
 		Args:                []string{"--dangerously-bypass-approvals-and-sandbox"},
 		ProcessNames:        []string{"codex"}, // Codex CLI binary
-		SessionIDEnv:        "",                 // Codex captures from JSONL output
+		SessionIDEnv:        "",                // Codex captures from JSONL output
 		ResumeFlag:          "resume",
 		ResumeStyle:         "subcommand",
 		SupportsHooks:       false, // Use env/files instead
@@ -293,8 +295,8 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 			"OPENCODE_PERMISSION": `{"*":"allow"}`,
 		},
 		ProcessNames:        []string{"opencode", "node", "bun"}, // Runs as Node.js or Bun
-		SessionIDEnv:        "",                                   // OpenCode manages sessions internally
-		ResumeFlag:          "",                                   // No resume support yet
+		SessionIDEnv:        "",                                  // OpenCode manages sessions internally
+		ResumeFlag:          "",                                  // No resume support yet
 		ResumeStyle:         "",
 		SupportsHooks:       true, // Uses .opencode/plugins/gastown.js
 		SupportsForkSession: false,
@@ -316,7 +318,7 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		Command:             "copilot",
 		Args:                []string{"--yolo"},
 		ProcessNames:        []string{"copilot"}, // Copilot CLI binary (Node.js but reports as "copilot")
-		SessionIDEnv:        "",                   // Session IDs stored on disk, not in env
+		SessionIDEnv:        "",                  // Session IDs stored on disk, not in env
 		ResumeFlag:          "--resume",
 		ResumeStyle:         "flag",
 		SupportsHooks:       true,  // Copilot CLI supports .github/hooks/*.json lifecycle hooks
@@ -371,6 +373,30 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		NonInteractive: &NonInteractiveConfig{
 			PromptFlag: "--prompt",
 		},
+	},
+	AgentKiro: {
+		Name:                AgentKiro,
+		Command:             "kiro-cli",
+		Args:                []string{"chat"},
+		ProcessNames:        []string{"kiro-cli", "kiro-cli-chat", "zsh"}, // Various kiro process names
+		SessionIDEnv:        "",                                           // TBD if kiro supports session env vars
+		ResumeFlag:          "",                                           // No resume support discovered yet
+		ResumeStyle:         "",
+		SupportsHooks:       false, // Kiro instructions file is informational only
+		SupportsForkSession: false,
+		NonInteractive: &NonInteractiveConfig{
+			Subcommand: "chat",
+			PromptFlag: "--agent", // For agent selection
+		},
+		// Runtime defaults
+		PromptMode:         "arg",
+		ConfigDir:          ".kiro",
+		HooksProvider:      "kiro",
+		HooksDir:           ".kiro",
+		HooksSettingsFile:  "kiro-instructions.md",
+		HooksInformational: true, // Instructions only, not executable hooks
+		ReadyDelayMs:       5000,
+		InstructionsFile:   "AGENTS.md",
 	},
 }
 
@@ -527,9 +553,9 @@ func RuntimeConfigFromPreset(preset AgentPreset) *RuntimeConfig {
 
 	rc := &RuntimeConfig{
 		Provider: string(info.Name),
-		Command: info.Command,
-		Args:    append([]string(nil), info.Args...), // Copy to avoid mutation
-		Env:     envCopy,
+		Command:  info.Command,
+		Args:     append([]string(nil), info.Args...), // Copy to avoid mutation
+		Env:      envCopy,
 	}
 
 	// Resolve command path for claude preset (handles alias installations)
