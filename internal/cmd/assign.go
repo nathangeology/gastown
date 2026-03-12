@@ -160,8 +160,11 @@ func runAssign(_ *cobra.Command, args []string) error {
 	if assignNudge {
 		nudgeMsg := fmt.Sprintf("New work on your hook: %s", title)
 		nudgeCmd := exec.Command("gt", "nudge", agentID, "-m", nudgeMsg)
-		if err := nudgeCmd.Run(); err != nil {
+		nudgeCmd.Stderr = os.Stderr
+		if out, err := nudgeCmd.Output(); err != nil {
 			fmt.Fprintf(os.Stderr, "%s Warning: nudge failed: %v\n", style.Warning.Render("⚠"), err)
+		} else if len(out) > 0 {
+			fmt.Print(string(out))
 		} else {
 			fmt.Printf("  Nudged %s\n", agentID)
 		}
