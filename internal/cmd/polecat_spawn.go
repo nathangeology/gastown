@@ -57,6 +57,28 @@ type SlingSpawnOptions struct {
 	BaseBranch string // Override base branch for polecat worktree (e.g., "develop", "release/v2")
 }
 
+var polecatSpawnHasSession = func(t *tmux.Tmux, sessionName string) (bool, error) {
+	return t.HasSession(sessionName)
+}
+
+var polecatSpawnKillSession = func(t *tmux.Tmux, sessionName string) error {
+	return t.KillSessionWithProcesses(sessionName)
+}
+
+func resetReusedPolecatSession(t *tmux.Tmux, sessionName string) error {
+	running, err := polecatSpawnHasSession(t, sessionName)
+	if err != nil {
+		return fmt.Errorf("checking reused polecat session %s: %w", sessionName, err)
+	}
+	if !running {
+		return nil
+	}
+	if err := polecatSpawnKillSession(t, sessionName); err != nil {
+		return fmt.Errorf("killing reused polecat session %s: %w", sessionName, err)
+	}
+	return nil
+}
+
 // SpawnPolecatForSling creates a fresh polecat and optionally starts its session.
 // This is used by gt sling when the target is a rig name.
 // The caller (sling) handles hook attachment and nudging.
@@ -208,6 +230,9 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 
 			polecatSessMgr := polecat.NewSessionManager(t, r)
 			sessionName := polecatSessMgr.SessionName(polecatName)
+			if err := resetReusedPolecatSession(t, sessionName); err != nil {
+				return nil, err
+			}
 
 			fmt.Printf("%s Polecat %s reused (idle → working, session start deferred)\n", style.Bold.Render("✓"), polecatName)
 			_ = events.LogFeed(events.TypeSpawn, "gt", events.SpawnPayload(rigName, polecatName))
