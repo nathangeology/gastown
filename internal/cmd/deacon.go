@@ -566,11 +566,13 @@ func startDeaconSession(t *tmux.Tmux, sessionName, agentOverride string) error {
 	// Accept startup dialogs (workspace trust + bypass permissions) if they appear.
 	_ = t.AcceptStartupDialogs(sessionName)
 
-	time.Sleep(constants.ShutdownNotifyDelay)
-
 	deaconTownRoot, _ := workspace.FindFromCwdOrError()
-	runtimeCfg := config.ResolveRoleAgentConfig("deacon", deaconTownRoot, "")
+	runtimeCfg := config.ResolveRoleAgentConfig("deacon", deaconTownRoot, deaconDir)
+	_ = t.WaitForRuntimeReady(sessionName, runtimeCfg, constants.ClaudeStartTimeout)
 	_ = runtime.RunStartupFallback(t, sessionName, "deacon", runtimeCfg)
+	_ = t.NudgeSession(sessionName, "Run `gt deacon heartbeat \"starting patrol cycle\"`. Then check `gt hook`. If no hook is attached, create `mol-deacon-patrol` as a wisp and execute it.")
+
+	time.Sleep(constants.ShutdownNotifyDelay)
 
 	return nil
 }

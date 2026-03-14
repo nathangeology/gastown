@@ -31,10 +31,12 @@ type tmuxOps interface {
 	GetPaneID(session string) (string, error)
 	ConfigureGasTownSession(session string, theme tmux.Theme, rig, worker, role string) error
 	WaitForCommand(session string, excludeCommands []string, timeout time.Duration) error
+	WaitForRuntimeReady(session string, rc *config.RuntimeConfig, timeout time.Duration) error
 	SetAutoRespawnHook(session string) error
 	AcceptStartupDialogs(session string) error
 	AcceptWorkspaceTrustDialog(session string) error
 	AcceptBypassPermissionsWarning(session string) error
+	NudgeSession(session, message string) error
 	SendKeysRaw(session, keys string) error
 	GetSessionInfo(name string) (*tmux.SessionInfo, error)
 }
@@ -178,6 +180,16 @@ func (m *Manager) Start(agentOverride string) error {
 
 	// Accept startup dialogs (workspace trust + bypass permissions) if they appear.
 	_ = t.AcceptStartupDialogs(sessionID)
+
+	// Wait for the runtime to become ready before sending startup nudges.
+	// This is required for non-hook agents like Codex; otherwise the Deacon
+	// reaches the prompt and never executes its patrol instructions.
+	_ = t.WaitForRuntimeReady(sessionID, runtimeConfig, constants.ClaudeStartTimeout)
+
+	for _, cmd := range runtime.StartupFallbackCommands("deacon", runtimeConfig) {
+		_ = t.NudgeSession(sessionID, cmd)
+	}
+	_ = t.NudgeSession(sessionID, "Run `gt deacon heartbeat \"starting patrol cycle\"`. Then check `gt hook`. If no hook is attached, create `mol-deacon-patrol` as a wisp and execute it.")
 
 	time.Sleep(constants.ShutdownNotifyDelay)
 
