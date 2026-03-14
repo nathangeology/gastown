@@ -36,6 +36,22 @@ type Manager struct {
 	rig     *rig.Rig
 	workDir string
 	output  io.Writer // Output destination for user-facing messages
+	tmux    refineryTmuxOps
+}
+
+type refineryTmuxOps interface {
+	HasSession(name string) (bool, error)
+	IsAgentAlive(session string) bool
+	CheckSessionHealth(session string, maxInactivity time.Duration) tmux.ZombieStatus
+	GetSessionInfo(name string) (*tmux.SessionInfo, error)
+	KillSession(name string) error
+	KillSessionWithProcesses(name string) error
+	NewSessionWithCommand(name, workDir, command string) error
+	SetEnvironment(session, key, value string) error
+	ConfigureGasTownSession(session string, theme tmux.Theme, rig, worker, role string) error
+	AcceptStartupDialogs(session string) error
+	WaitForRuntimeReady(session string, rc *config.RuntimeConfig, timeout time.Duration) error
+	NudgeSession(session, message string) error
 }
 
 type scoredIssue struct {
@@ -49,6 +65,7 @@ func NewManager(r *rig.Rig) *Manager {
 		rig:     r,
 		workDir: r.Path,
 		output:  os.Stdout,
+		tmux:    tmux.NewTmux(),
 	}
 }
 
@@ -69,7 +86,7 @@ func (m *Manager) SessionName() string {
 // ZFC: tmux session existence is the source of truth for session state,
 // but agent liveness determines if the session is actually functional.
 func (m *Manager) IsRunning() (bool, error) {
-	t := tmux.NewTmux()
+	t := m.tmux
 	sessionName := m.SessionName()
 	status := t.CheckSessionHealth(sessionName, 0)
 	return status == tmux.SessionHealthy, nil
@@ -81,14 +98,14 @@ func (m *Manager) IsRunning() (bool, error) {
 // Returns the detailed ZombieStatus for callers that need to distinguish
 // between different failure modes.
 func (m *Manager) IsHealthy(maxInactivity time.Duration) tmux.ZombieStatus {
-	t := tmux.NewTmux()
+	t := m.tmux
 	return t.CheckSessionHealth(m.SessionName(), maxInactivity)
 }
 
 // Status returns information about the refinery session.
 // ZFC-compliant: tmux session is the source of truth.
 func (m *Manager) Status() (*tmux.SessionInfo, error) {
-	t := tmux.NewTmux()
+	t := m.tmux
 	sessionID := m.SessionName()
 
 	running, err := t.HasSession(sessionID)
@@ -108,7 +125,7 @@ func (m *Manager) Status() (*tmux.SessionInfo, error) {
 // The agentOverride parameter allows specifying an agent alias to use instead of the town default.
 // ZFC-compliant: no state file, tmux session is source of truth.
 func (m *Manager) Start(foreground bool, agentOverride string) error {
-	t := tmux.NewTmux()
+	t := m.tmux
 	sessionID := m.SessionName()
 
 	if foreground {
@@ -220,7 +237,10 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
 		return fmt.Errorf("waiting for refinery to start: %w", err)
 	}
 
-	_ = runtime.RunStartupFallback(t, sessionID, "refinery", runtimeConfig)
+	for _, cmd := range runtime.StartupFallbackCommands("refinery", runtimeConfig) {
+		_ = t.NudgeSession(sessionID, cmd)
+	}
+	_ = t.NudgeSession(sessionID, refineryStartupNudge())
 
 	// Stream refinery's Claude Code JSONL conversation log to VictoriaLogs (opt-in).
 	if os.Getenv("GT_LOG_AGENT_OUTPUT") == "true" && os.Getenv("GT_OTEL_LOGS_URL") != "" {
@@ -239,7 +259,7 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
 // Stop stops the refinery.
 // ZFC-compliant: tmux session is the source of truth.
 func (m *Manager) Stop() error {
-	t := tmux.NewTmux()
+	t := m.tmux
 	sessionID := m.SessionName()
 
 	// Check if tmux session exists
@@ -250,6 +270,10 @@ func (m *Manager) Stop() error {
 
 	// Kill the tmux session
 	return t.KillSession(sessionID)
+}
+
+func refineryStartupNudge() string {
+	return "Run `gt hook`. If no hook is attached, inspect the ready merge queue with `gt refinery ready --all --json`, claim the best ready MR, validate it, and merge it to `main` if clear. If nothing is ready, begin patrol and keep processing work as it arrives."
 }
 
 // Queue returns the current merge queue.

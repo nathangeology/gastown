@@ -1,17 +1,70 @@
 package refinery
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/testutil"
+	"github.com/steveyegge/gastown/internal/tmux"
 )
+
+type mockRefineryTmux struct {
+	hasSessionResult bool
+	agentAlive       bool
+	sessionInfo      *tmux.SessionInfo
+	sessionInfoErr   error
+	waitErr          error
+	newSessionErr    error
+
+	newSessionCalls int
+	killCalls       []string
+	nudges          []string
+}
+
+func (m *mockRefineryTmux) HasSession(_ string) (bool, error) { return m.hasSessionResult, nil }
+func (m *mockRefineryTmux) IsAgentAlive(_ string) bool        { return m.agentAlive }
+func (m *mockRefineryTmux) CheckSessionHealth(_ string, _ time.Duration) tmux.ZombieStatus {
+	if m.hasSessionResult && m.agentAlive {
+		return tmux.SessionHealthy
+	}
+	return tmux.SessionDead
+}
+func (m *mockRefineryTmux) GetSessionInfo(_ string) (*tmux.SessionInfo, error) {
+	return m.sessionInfo, m.sessionInfoErr
+}
+func (m *mockRefineryTmux) KillSession(name string) error {
+	m.killCalls = append(m.killCalls, name)
+	return nil
+}
+func (m *mockRefineryTmux) KillSessionWithProcesses(name string) error {
+	m.killCalls = append(m.killCalls, name)
+	return nil
+}
+func (m *mockRefineryTmux) NewSessionWithCommand(_, _, _ string) error {
+	m.newSessionCalls++
+	return m.newSessionErr
+}
+func (m *mockRefineryTmux) SetEnvironment(_, _, _ string) error { return nil }
+func (m *mockRefineryTmux) ConfigureGasTownSession(_ string, _ tmux.Theme, _, _, _ string) error {
+	return nil
+}
+func (m *mockRefineryTmux) AcceptStartupDialogs(_ string) error { return nil }
+func (m *mockRefineryTmux) WaitForRuntimeReady(_ string, _ *config.RuntimeConfig, _ time.Duration) error {
+	return m.waitErr
+}
+func (m *mockRefineryTmux) NudgeSession(_, message string) error {
+	m.nudges = append(m.nudges, message)
+	return nil
+}
 
 func setupTestRegistry(t *testing.T) {
 	t.Helper()
@@ -45,6 +98,13 @@ func setupTestManager(t *testing.T) (*Manager, string) {
 	return NewManager(r), rigPath
 }
 
+func setupMockManager(t *testing.T, mock *mockRefineryTmux) *Manager {
+	t.Helper()
+	mgr, _ := setupTestManager(t)
+	mgr.tmux = mock
+	return mgr
+}
+
 func TestManager_SessionName(t *testing.T) {
 	mgr, _ := setupTestManager(t)
 
@@ -52,6 +112,45 @@ func TestManager_SessionName(t *testing.T) {
 	got := mgr.SessionName()
 	if got != want {
 		t.Errorf("SessionName() = %s, want %s", got, want)
+	}
+}
+
+func TestManager_Start_NudgesRefineryPatrol(t *testing.T) {
+	mock := &mockRefineryTmux{}
+	mgr := setupMockManager(t, mock)
+
+	err := mgr.Start(false, "codex")
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if mock.newSessionCalls != 1 {
+		t.Fatalf("expected 1 session creation, got %d", mock.newSessionCalls)
+	}
+	if len(mock.nudges) == 0 {
+		t.Fatal("expected refinery startup to send at least one nudge")
+	}
+	foundPatrol := false
+	for _, nudge := range mock.nudges {
+		if strings.Contains(nudge, "gt refinery ready --all --json") && strings.Contains(nudge, "merge it to `main` if clear") {
+			foundPatrol = true
+			break
+		}
+	}
+	if !foundPatrol {
+		t.Fatalf("expected refinery patrol nudge, got %#v", mock.nudges)
+	}
+}
+
+func TestManager_Start_KillsSessionWhenRuntimeReadyFails(t *testing.T) {
+	mock := &mockRefineryTmux{waitErr: errors.New("runtime never became ready")}
+	mgr := setupMockManager(t, mock)
+
+	err := mgr.Start(false, "codex")
+	if err == nil {
+		t.Fatal("Start() should return runtime readiness error")
+	}
+	if len(mock.killCalls) == 0 {
+		t.Fatal("expected cleanup kill after runtime readiness failure")
 	}
 }
 
