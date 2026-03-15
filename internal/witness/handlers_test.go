@@ -1,16 +1,20 @@
 package witness
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/polecat"
+	"github.com/steveyegge/gastown/internal/testutil"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
@@ -355,6 +359,56 @@ func fakeBd() (*BdCli, *mockBdCalls) {
 		},
 		func(args []string) error { return nil },
 	)
+}
+
+type recoveryMailIssue struct {
+	Title       string `json:"title"`
+	Assignee    string `json:"assignee"`
+	Priority    string `json:"priority"`
+	Description string `json:"description"`
+}
+
+func setupRecoveryRouter(t *testing.T) (string, *mail.Router, *beads.Beads) {
+	t.Helper()
+	testutil.RequireDoltContainer(t)
+
+	doltPort, err := strconv.Atoi(testutil.DoltContainerPort())
+	if err != nil {
+		t.Fatalf("parse Dolt port: %v", err)
+	}
+
+	townRoot := t.TempDir()
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+
+	prefix := fmt.Sprintf("wr%x", time.Now().UnixNano()&0xfffffff)
+	b := beads.NewIsolatedWithPort(townRoot, doltPort)
+	if err := b.Init(prefix); err != nil {
+		t.Fatalf("bd init: %v", err)
+	}
+
+	t.Setenv("BEADS_DB", filepath.Join(beadsDir, "beads.db"))
+	if _, err := b.Run("config", "set", "types.custom", "agent,role,rig,convoy,slot,queue,event,message,molecule,gate,merge-request"); err != nil {
+		t.Fatalf("config set types.custom: %v", err)
+	}
+
+	return townRoot, mail.NewRouterWithTownRoot(townRoot, townRoot), b
+}
+
+func listRecoveryMailIssues(t *testing.T, b *beads.Beads) []recoveryMailIssue {
+	t.Helper()
+	out, err := b.Run("list", "--json", "--limit=0")
+	if err != nil {
+		t.Fatalf("bd list: %v", err)
+	}
+
+	var issues []recoveryMailIssue
+	if err := json.Unmarshal(out, &issues); err != nil {
+		t.Fatalf("unmarshal mail issues: %v\n%s", err, out)
+	}
+	return issues
 }
 
 func TestFindCleanupWisp_UsesCorrectBdListFlags(t *testing.T) {
@@ -887,6 +941,118 @@ func TestResetAbandonedBead_ResetsWhenWorkNotOnMain(t *testing.T) {
 	}
 	if !foundUpdate {
 		t.Errorf("expected bd update --status=open to be called, got calls: %v", mock.calls)
+	}
+}
+
+func TestResetAbandonedBead_SendsRecoveredBeadMail(t *testing.T) {
+	oldVerify := verifyCommitOnMain
+	verifyCommitOnMain = func(workDir, rigName, polecatName string) (bool, error) {
+		return false, nil
+	}
+	t.Cleanup(func() { verifyCommitOnMain = oldVerify })
+
+	townRoot, router, beadDB := setupRecoveryRouter(t)
+	bd, mock := mockBd(
+		func(args []string) (string, error) {
+			if len(args) > 0 && args[0] == "show" {
+				return `[{"status":"hooked"}]`, nil
+			}
+			return "[]", nil
+		},
+		func(args []string) error { return nil },
+	)
+
+	if !resetAbandonedBead(bd, townRoot, "testrig", "gt-work123", "alpha", router) {
+		t.Fatal("resetAbandonedBead returned false, want true")
+	}
+	router.WaitPendingNotifications()
+
+	issues := listRecoveryMailIssues(t, beadDB)
+	if len(issues) != 1 {
+		t.Fatalf("mail issue count = %d, want 1", len(issues))
+	}
+
+	issue := issues[0]
+	if issue.Title != "RECOVERED_BEAD gt-work123" {
+		t.Fatalf("mail subject = %q, want %q", issue.Title, "RECOVERED_BEAD gt-work123")
+	}
+	if issue.Assignee != "deacon" {
+		t.Fatalf("mail assignee = %q, want %q", issue.Assignee, "deacon")
+	}
+	if issue.Priority != string(mail.PriorityHigh) {
+		t.Fatalf("mail priority = %q, want %q", issue.Priority, mail.PriorityHigh)
+	}
+	if !strings.Contains(issue.Description, "Polecat: testrig/alpha") {
+		t.Fatalf("mail body missing polecat address: %q", issue.Description)
+	}
+	if !strings.Contains(issue.Description, "Respawn Count: 1") {
+		t.Fatalf("mail body missing respawn count: %q", issue.Description)
+	}
+
+	var foundUpdate bool
+	for _, call := range mock.calls {
+		if strings.Contains(call, "update gt-work123 --status=open --assignee=") {
+			foundUpdate = true
+			break
+		}
+	}
+	if !foundUpdate {
+		t.Fatalf("expected bead reset before notification, got calls: %v", mock.calls)
+	}
+}
+
+func TestResetAbandonedBead_SpawnBlockedEscalatesToMayor(t *testing.T) {
+	oldVerify := verifyCommitOnMain
+	verifyCommitOnMain = func(workDir, rigName, polecatName string) (bool, error) {
+		return false, nil
+	}
+	t.Cleanup(func() { verifyCommitOnMain = oldVerify })
+
+	townRoot, router, beadDB := setupRecoveryRouter(t)
+	maxRespawns := config.LoadOperationalConfig(townRoot).GetWitnessConfig().MaxBeadRespawnsV()
+	for i := 0; i < maxRespawns; i++ {
+		RecordBeadRespawn(townRoot, "gt-work123")
+	}
+
+	bd, mock := mockBd(
+		func(args []string) (string, error) {
+			if len(args) > 0 && args[0] == "show" {
+				return `[{"status":"hooked"}]`, nil
+			}
+			return "[]", nil
+		},
+		func(args []string) error { return nil },
+	)
+
+	if resetAbandonedBead(bd, townRoot, "testrig", "gt-work123", "alpha", router) {
+		t.Fatal("resetAbandonedBead returned true, want false when respawn is blocked")
+	}
+	router.WaitPendingNotifications()
+
+	issues := listRecoveryMailIssues(t, beadDB)
+	if len(issues) != 1 {
+		t.Fatalf("mail issue count = %d, want 1", len(issues))
+	}
+
+	issue := issues[0]
+	wantSubject := "SPAWN_BLOCKED gt-work123 (respawn limit reached)"
+	if issue.Title != wantSubject {
+		t.Fatalf("mail subject = %q, want %q", issue.Title, wantSubject)
+	}
+	if issue.Assignee != "mayor" {
+		t.Fatalf("mail assignee = %q, want %q", issue.Assignee, "mayor")
+	}
+	if issue.Priority != string(mail.PriorityUrgent) {
+		t.Fatalf("mail priority = %q, want %q", issue.Priority, mail.PriorityUrgent)
+	}
+	if !strings.Contains(issue.Description, "Re-dispatch blocked to prevent spawn storm.") {
+		t.Fatalf("mail body missing spawn-block explanation: %q", issue.Description)
+	}
+
+	for _, call := range mock.calls {
+		if strings.Contains(call, "update") {
+			t.Fatalf("blocked respawn should not reset bead, got calls: %v", mock.calls)
+		}
 	}
 }
 
@@ -1655,7 +1821,6 @@ func TestClearCompletionMetadata_NoBd(t *testing.T) {
 	}
 }
 
-
 // --- Heartbeat v2 tests (gt-3vr5) ---
 
 func TestHeartbeatV2_ExitingStateSkipsZombieDetection(t *testing.T) {
@@ -1798,4 +1963,3 @@ func TestZombieAgentSelfReportedStuck_Classification(t *testing.T) {
 		t.Error("ZombieAgentSelfReportedStuck should imply active work")
 	}
 }
-

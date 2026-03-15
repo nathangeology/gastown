@@ -1,17 +1,20 @@
 package deacon
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
 
 func TestParseRecoveredBeadSubject(t *testing.T) {
 	tests := []struct {
-		subject  string
-		wantID   string
-		wantOK   bool
+		subject string
+		wantID  string
+		wantOK  bool
 	}{
 		{"RECOVERED_BEAD gt-abc123", "gt-abc123", true},
 		{"RECOVERED_BEAD bd-xyz", "bd-xyz", true},
@@ -201,5 +204,121 @@ func TestRedispatchState_GetBeadState(t *testing.T) {
 	bead3 := state.GetBeadState("gt-other")
 	if bead == bead3 {
 		t.Error("expected different bead state for different ID")
+	}
+}
+
+func TestRedispatch_RedispatchesOpenBead(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses POSIX shell script mocks")
+	}
+
+	townRoot := t.TempDir()
+	binDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0o755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	routes := `{"prefix":"gt-","path":"gastown"}` + "\n"
+	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte(routes), 0o644); err != nil {
+		t.Fatalf("write routes: %v", err)
+	}
+
+	slingLog := filepath.Join(townRoot, "sling.log")
+	bdScript := `#!/bin/sh
+if [ "$1" = "show" ]; then
+  echo '[{"status":"open"}]'
+  exit 0
+fi
+echo "unexpected bd args: $*" >&2
+exit 1
+`
+	gtScript := fmt.Sprintf(`#!/bin/sh
+if [ "$1" = "sling" ]; then
+  echo "$@" >> "%s"
+  exit 0
+fi
+echo "unexpected gt args: $*" >&2
+exit 1
+`, slingLog)
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(bdScript), 0o755); err != nil {
+		t.Fatalf("write fake bd: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(binDir, "gt"), []byte(gtScript), 0o755); err != nil {
+		t.Fatalf("write fake gt: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	result := Redispatch(townRoot, "gt-abc123", "", 3, 0)
+	if result.Action != "redispatched" {
+		t.Fatalf("action = %q, want %q (err=%v)", result.Action, "redispatched", result.Error)
+	}
+	if result.TargetRig != "gastown" {
+		t.Fatalf("target rig = %q, want %q", result.TargetRig, "gastown")
+	}
+	if result.Attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", result.Attempts)
+	}
+
+	logData, err := os.ReadFile(slingLog)
+	if err != nil {
+		t.Fatalf("read sling log: %v", err)
+	}
+	logText := string(logData)
+	if !strings.Contains(logText, "sling gt-abc123 gastown --force --no-convoy") {
+		t.Fatalf("unexpected sling invocation log: %q", logText)
+	}
+}
+
+func TestRedispatch_EscalatesAfterMaxAttempts(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses POSIX shell script mocks")
+	}
+
+	townRoot := t.TempDir()
+	binDir := t.TempDir()
+	mailLog := filepath.Join(townRoot, "mail.log")
+
+	state := &RedispatchState{}
+	bead := state.GetBeadState("gt-abc123")
+	bead.AttemptCount = 3
+	bead.LastRig = "gastown"
+	bead.LastAttemptTime = time.Now().Add(-2 * DefaultRedispatchCooldown)
+	if err := SaveRedispatchState(townRoot, state); err != nil {
+		t.Fatalf("save redispatch state: %v", err)
+	}
+
+	gtScript := fmt.Sprintf(`#!/bin/sh
+if [ "$1" = "mail" ] && [ "$2" = "send" ]; then
+  echo "$@" >> "%s"
+  exit 0
+fi
+echo "unexpected gt args: $*" >&2
+exit 1
+`, mailLog)
+	if err := os.WriteFile(filepath.Join(binDir, "gt"), []byte(gtScript), 0o755); err != nil {
+		t.Fatalf("write fake gt: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	result := Redispatch(townRoot, "gt-abc123", "gastown", 3, 0)
+	if result.Action != "escalated" {
+		t.Fatalf("action = %q, want %q (err=%v)", result.Action, "escalated", result.Error)
+	}
+	if result.Error != nil {
+		t.Fatalf("unexpected escalation error: %v", result.Error)
+	}
+	if !strings.Contains(result.Message, "escalated to Mayor after 3 failed re-dispatches") {
+		t.Fatalf("message = %q, want escalation summary", result.Message)
+	}
+
+	logData, err := os.ReadFile(mailLog)
+	if err != nil {
+		t.Fatalf("read mail log: %v", err)
+	}
+	logText := string(logData)
+	if !strings.Contains(logText, "mail send mayor/") {
+		t.Fatalf("expected mayor escalation mail, got %q", logText)
+	}
+	if !strings.Contains(logText, "REDISPATCH_FAILED: gt-abc123 (3 attempts)") {
+		t.Fatalf("expected redispatch failure subject, got %q", logText)
 	}
 }
