@@ -3,9 +3,14 @@
 package web
 
 import (
+	"encoding/json"
+	"io/fs"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,26 +19,24 @@ import (
 	"github.com/steveyegge/gastown/internal/activity"
 )
 
-// =============================================================================
-// Browser-based E2E Tests using Rod
-//
-// These tests launch a real browser (Chromium) to verify the convoy dashboard
-// works correctly in an actual browser environment.
-//
-// Run with: go test -tags=browser -v ./internal/web -run TestBrowser
-//
-// By default, tests run headless. Set BROWSER_VISIBLE=1 to watch:
-//   BROWSER_VISIBLE=1 go test -tags=browser -v ./internal/web -run TestBrowser
-//
-// =============================================================================
-
-// browserTestConfig holds configuration for browser tests
 type browserTestConfig struct {
 	headless bool
 	slowMo   time.Duration
 }
 
-// getBrowserConfig returns test configuration based on environment
+type browserAPIMock struct {
+	commands        []CommandInfo
+	options         OptionsResponse
+	runOutput       string
+	runMu           sync.Mutex
+	runCommands     []string
+	issueMu         sync.Mutex
+	issueRequests   []IssueCreateRequest
+	issueResponse   IssueCreateResponse
+	sseConnections  atomic.Int32
+	closeFirstSSE   bool
+}
+
 func getBrowserConfig() browserTestConfig {
 	cfg := browserTestConfig{
 		headless: true,
@@ -48,7 +51,6 @@ func getBrowserConfig() browserTestConfig {
 	return cfg
 }
 
-// launchBrowser creates a browser instance with the given configuration.
 func launchBrowser(cfg browserTestConfig) (*rod.Browser, func()) {
 	l := launcher.New().
 		NoSandbox(true).
@@ -73,20 +75,112 @@ func launchBrowser(cfg browserTestConfig) (*rod.Browser, func()) {
 	return browser, cleanup
 }
 
-// mockFetcher implements ConvoyFetcher for testing
-type mockFetcher struct {
-	convoys []ConvoyRow
+func newBrowserDashboardServer(t *testing.T, fetcher *MockConvoyFetcher, api *browserAPIMock) *httptest.Server {
+	t.Helper()
+
+	if fetcher == nil {
+		fetcher = &MockConvoyFetcher{}
+	}
+	if api == nil {
+		api = &browserAPIMock{}
+	}
+	if api.issueResponse == (IssueCreateResponse{}) {
+		api.issueResponse = IssueCreateResponse{Success: true, ID: "gs-browser-1", Message: "Created issue: gs-browser-1"}
+	}
+
+	handler, err := NewConvoyHandler(fetcher, 8*time.Second, "test-token")
+	if err != nil {
+		t.Fatalf("Failed to create handler: %v", err)
+	}
+
+	staticFS, err := fs.Sub(staticFiles, "static")
+	if err != nil {
+		t.Fatalf("Failed to load static assets: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticFS))))
+	mux.HandleFunc("/api/commands", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(CommandListResponse{Commands: api.commands})
+	})
+	mux.HandleFunc("/api/options", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(api.options)
+	})
+	mux.HandleFunc("/api/run", func(w http.ResponseWriter, r *http.Request) {
+		var req CommandRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode /api/run request: %v", err)
+		}
+		api.runMu.Lock()
+		api.runCommands = append(api.runCommands, req.Command)
+		api.runMu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(CommandResponse{
+			Success:    true,
+			Output:     api.runOutput,
+			Command:    req.Command,
+			DurationMs: 1,
+		})
+	})
+	mux.HandleFunc("/api/issues/create", func(w http.ResponseWriter, r *http.Request) {
+		var req IssueCreateRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode /api/issues/create request: %v", err)
+		}
+		api.issueMu.Lock()
+		api.issueRequests = append(api.issueRequests, req)
+		api.issueMu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(api.issueResponse)
+	})
+	mux.HandleFunc("/api/events", func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "flusher unavailable", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+
+		conn := api.sseConnections.Add(1)
+		_, _ = w.Write([]byte("event: connected\ndata: ok\n\n"))
+		flusher.Flush()
+
+		if api.closeFirstSSE && conn == 1 {
+			time.Sleep(100 * time.Millisecond)
+			return
+		}
+
+		<-r.Context().Done()
+	})
+	mux.Handle("/", handler)
+
+	return httptest.NewServer(mux)
 }
 
-func (m *mockFetcher) FetchConvoys() ([]ConvoyRow, error) {
-	return m.convoys, nil
+func waitForEval(t *testing.T, page *rod.Page, timeout time.Duration, js string) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if page.MustEval(js).Bool() {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	t.Fatalf("condition not satisfied within %v: %s", timeout, js)
 }
 
-// TestBrowser_ConvoyListLoads tests that the convoy list page loads correctly
 func TestBrowser_ConvoyListLoads(t *testing.T) {
-	// Setup test server with mock data
-	fetcher := &mockFetcher{
-		convoys: []ConvoyRow{
+	fetcher := &MockConvoyFetcher{
+		Convoys: []ConvoyRow{
 			{
 				ID:           "hq-cv-abc",
 				Title:        "Feature X",
@@ -108,12 +202,7 @@ func TestBrowser_ConvoyListLoads(t *testing.T) {
 		},
 	}
 
-	handler, err := NewConvoyHandler(fetcher, 8*time.Second, "test-token")
-	if err != nil {
-		t.Fatalf("Failed to create handler: %v", err)
-	}
-
-	ts := httptest.NewServer(handler)
+	ts := newBrowserDashboardServer(t, fetcher, &browserAPIMock{})
 	defer ts.Close()
 
 	cfg := getBrowserConfig()
@@ -125,64 +214,33 @@ func TestBrowser_ConvoyListLoads(t *testing.T) {
 
 	page.MustWaitLoad()
 
-	// Verify page title
 	title := page.MustElement("title").MustText()
 	if !strings.Contains(title, "Gas Town") {
 		t.Fatalf("Expected title to contain 'Gas Town', got: %s", title)
 	}
 
-	// Verify convoy IDs are displayed
 	bodyText := page.MustElement("body").MustText()
-	if !strings.Contains(bodyText, "hq-cv-abc") {
-		t.Error("Expected convoy ID hq-cv-abc in page")
+	for _, want := range []string{"hq-cv-abc", "hq-cv-def", "Feature X", "Bugfix Y"} {
+		if !strings.Contains(bodyText, want) {
+			t.Errorf("Expected %q in page body", want)
+		}
 	}
-	if !strings.Contains(bodyText, "hq-cv-def") {
-		t.Error("Expected convoy ID hq-cv-def in page")
-	}
-
-	// Verify titles are displayed
-	if !strings.Contains(bodyText, "Feature X") {
-		t.Error("Expected title 'Feature X' in page")
-	}
-	if !strings.Contains(bodyText, "Bugfix Y") {
-		t.Error("Expected title 'Bugfix Y' in page")
-	}
-
-	t.Log("PASSED: Convoy list loads correctly")
 }
 
-// TestBrowser_LastActivityColors tests that activity colors are displayed correctly
-func TestBrowser_LastActivityColors(t *testing.T) {
-	// Setup test server with convoys at different activity ages
-	fetcher := &mockFetcher{
-		convoys: []ConvoyRow{
+func TestBrowser_SSEReconnectsAfterDisconnect(t *testing.T) {
+	fetcher := &MockConvoyFetcher{
+		Convoys: []ConvoyRow{
 			{
-				ID:           "hq-cv-green",
-				Title:        "Active Work",
+				ID:           "hq-cv-live",
+				Title:        "Live Convoy",
 				Status:       "open",
-				LastActivity: activity.Calculate(time.Now().Add(-1 * time.Minute)), // Green: <5min
-			},
-			{
-				ID:           "hq-cv-yellow",
-				Title:        "Stale Work",
-				Status:       "open",
-				LastActivity: activity.Calculate(time.Now().Add(-6 * time.Minute)), // Yellow: 5-10min
-			},
-			{
-				ID:           "hq-cv-red",
-				Title:        "Stuck Work",
-				Status:       "open",
-				LastActivity: activity.Calculate(time.Now().Add(-11 * time.Minute)), // Red: >=10min
+				LastActivity: activity.Calculate(time.Now().Add(-30 * time.Second)),
 			},
 		},
 	}
+	api := &browserAPIMock{closeFirstSSE: true}
 
-	handler, err := NewConvoyHandler(fetcher, 8*time.Second, "test-token")
-	if err != nil {
-		t.Fatalf("Failed to create handler: %v", err)
-	}
-
-	ts := httptest.NewServer(handler)
+	ts := newBrowserDashboardServer(t, fetcher, api)
 	defer ts.Close()
 
 	cfg := getBrowserConfig()
@@ -191,136 +249,37 @@ func TestBrowser_LastActivityColors(t *testing.T) {
 
 	page := browser.MustPage(ts.URL).Timeout(30 * time.Second)
 	defer page.MustClose()
-
 	page.MustWaitLoad()
 
-	// Check for activity color classes in the HTML
-	html := page.MustHTML()
+	waitForEval(t, page, 3*time.Second, `() => document.getElementById('connection-status')?.textContent === 'Live'`)
+	waitForEval(t, page, 5*time.Second, `() => document.getElementById('connection-status')?.textContent === 'Reconnecting...'`)
+	waitForEval(t, page, 5*time.Second, `() => document.getElementById('connection-status')?.textContent === 'Live'`)
 
-	if !strings.Contains(html, "activity-green") {
-		t.Error("Expected activity-green class for recent activity")
+	if api.sseConnections.Load() < 2 {
+		t.Fatalf("Expected at least 2 SSE connections, got %d", api.sseConnections.Load())
 	}
-	if !strings.Contains(html, "activity-yellow") {
-		t.Error("Expected activity-yellow class for stale activity")
-	}
-	if !strings.Contains(html, "activity-red") {
-		t.Error("Expected activity-red class for stuck activity")
-	}
-
-	t.Log("PASSED: Activity colors display correctly")
 }
 
-// TestBrowser_HtmxAutoRefresh tests that htmx auto-refresh attributes are present
-func TestBrowser_HtmxAutoRefresh(t *testing.T) {
-	fetcher := &mockFetcher{
-		convoys: []ConvoyRow{
-			{
-				ID:     "hq-cv-test",
-				Title:  "Test Convoy",
-				Status: "open",
-			},
+func TestBrowser_CommandPaletteFlows(t *testing.T) {
+	fetcher := &MockConvoyFetcher{
+		Convoys: []ConvoyRow{
+			{ID: "hq-cv-palette", Status: "open"},
 		},
 	}
-
-	handler, err := NewConvoyHandler(fetcher, 8*time.Second, "test-token")
-	if err != nil {
-		t.Fatalf("Failed to create handler: %v", err)
-	}
-
-	ts := httptest.NewServer(handler)
-	defer ts.Close()
-
-	cfg := getBrowserConfig()
-	browser, cleanup := launchBrowser(cfg)
-	defer cleanup()
-
-	page := browser.MustPage(ts.URL).Timeout(30 * time.Second)
-	defer page.MustClose()
-
-	page.MustWaitLoad()
-
-	// Check for htmx attributes
-	html := page.MustHTML()
-
-	if !strings.Contains(html, "hx-get") {
-		t.Error("Expected hx-get attribute for auto-refresh")
-	}
-	if !strings.Contains(html, "hx-trigger") {
-		t.Error("Expected hx-trigger attribute for auto-refresh")
-	}
-	if !strings.Contains(html, "every 30s") {
-		t.Error("Expected 'every 30s' trigger for auto-refresh")
-	}
-
-	// Verify htmx library is loaded
-	if !strings.Contains(html, "htmx.org") {
-		t.Error("Expected htmx library to be loaded")
-	}
-
-	t.Log("PASSED: htmx auto-refresh attributes present")
-}
-
-// TestBrowser_EmptyState tests the empty state when no convoys exist
-func TestBrowser_EmptyState(t *testing.T) {
-	fetcher := &mockFetcher{
-		convoys: []ConvoyRow{}, // Empty convoy list
-	}
-
-	handler, err := NewConvoyHandler(fetcher, 8*time.Second, "test-token")
-	if err != nil {
-		t.Fatalf("Failed to create handler: %v", err)
-	}
-
-	ts := httptest.NewServer(handler)
-	defer ts.Close()
-
-	cfg := getBrowserConfig()
-	browser, cleanup := launchBrowser(cfg)
-	defer cleanup()
-
-	page := browser.MustPage(ts.URL).Timeout(30 * time.Second)
-	defer page.MustClose()
-
-	page.MustWaitLoad()
-
-	// Check for empty state message
-	bodyText := page.MustElement("body").MustText()
-
-	if !strings.Contains(bodyText, "No convoys") {
-		t.Errorf("Expected 'No convoys' empty state message, got: %s", bodyText[:min(len(bodyText), 500)])
-	}
-
-	// Verify help text is shown
-	if !strings.Contains(bodyText, "gt convoy create") {
-		t.Error("Expected help text with 'gt convoy create' command")
-	}
-
-	t.Log("PASSED: Empty state displays correctly")
-}
-
-// TestBrowser_StatusIndicators tests open/closed status indicators
-func TestBrowser_StatusIndicators(t *testing.T) {
-	fetcher := &mockFetcher{
-		convoys: []ConvoyRow{
-			{
-				ID:     "hq-cv-open",
-				Title:  "Open Convoy",
-				Status: "open",
-			},
-			{
-				ID:     "hq-cv-closed",
-				Title:  "Closed Convoy",
-				Status: "closed",
+	api := &browserAPIMock{
+		commands: []CommandInfo{
+			{Name: "status", Desc: "Show town status", Category: "Status"},
+			{Name: "mail send", Desc: "Send message", Category: "Mail", Args: "<address> -s <subject> -m <message>", ArgType: "agents"},
+		},
+		options: OptionsResponse{
+			Agents: []OptionItem{
+				{Name: "gastown/witness", Running: true},
 			},
 		},
+		runOutput: "town healthy",
 	}
 
-	handler, err := NewConvoyHandler(fetcher, 8*time.Second, "test-token")
-	if err != nil {
-		t.Fatalf("Failed to create handler: %v", err)
-	}
-
-	ts := httptest.NewServer(handler)
+	ts := newBrowserDashboardServer(t, fetcher, api)
 	defer ts.Close()
 
 	cfg := getBrowserConfig()
@@ -329,43 +288,46 @@ func TestBrowser_StatusIndicators(t *testing.T) {
 
 	page := browser.MustPage(ts.URL).Timeout(30 * time.Second)
 	defer page.MustClose()
-
 	page.MustWaitLoad()
 
-	html := page.MustHTML()
+	page.MustElement("#open-palette-btn").MustClick()
+	waitForEval(t, page, 2*time.Second, `() => document.getElementById('command-palette-overlay')?.classList.contains('open')`)
 
-	// Check for status classes
-	if !strings.Contains(html, "status-open") {
-		t.Error("Expected status-open class for open convoy")
-	}
-	if !strings.Contains(html, "status-closed") {
-		t.Error("Expected status-closed class for closed convoy")
-	}
+	page.MustElement("#command-palette-input").MustInput("status")
+	waitForEval(t, page, 2*time.Second, `() => document.querySelectorAll('.command-item').length >= 1`)
+	page.MustElement(".command-item").MustClick()
 
-	t.Log("PASSED: Status indicators display correctly")
+	waitForEval(t, page, 3*time.Second, `() => document.getElementById('output-panel')?.classList.contains('open')`)
+	waitForEval(t, page, 2*time.Second, `() => document.getElementById('output-panel-content')?.textContent.includes('town healthy')`)
+
+	api.runMu.Lock()
+	if len(api.runCommands) == 0 || api.runCommands[0] != "status" {
+		t.Fatalf("Expected palette to run status, got %v", api.runCommands)
+	}
+	api.runMu.Unlock()
+
+	page.MustElement("#open-palette-btn").MustClick()
+	waitForEval(t, page, 2*time.Second, `() => document.getElementById('command-palette-overlay')?.classList.contains('open')`)
+
+	page.MustElement("#command-palette-input").MustInput("mail send")
+	waitForEval(t, page, 2*time.Second, `() => Array.from(document.querySelectorAll('.command-item')).some(el => el.textContent.includes('mail send'))`)
+	page.MustElement(".command-item").MustClick()
+
+	waitForEval(t, page, 2*time.Second, `() => document.querySelector('.command-args-header')?.textContent.includes('gt mail send')`)
+	waitForEval(t, page, 2*time.Second, `() => document.getElementById('arg-field-2')?.tagName === 'TEXTAREA'`)
 }
 
-// TestBrowser_ProgressDisplay tests progress bar rendering
-func TestBrowser_ProgressDisplay(t *testing.T) {
-	fetcher := &mockFetcher{
-		convoys: []ConvoyRow{
-			{
-				ID:        "hq-cv-progress",
-				Title:     "Progress Convoy",
-				Status:    "open",
-				Progress:  "3/7",
-				Completed: 3,
-				Total:     7,
-			},
+func TestBrowser_IssueModalCreateFlow(t *testing.T) {
+	fetcher := &MockConvoyFetcher{
+		Issues: []IssueRow{
+			{ID: "gs-1", Title: "Existing issue", Type: "task", Priority: 2},
 		},
 	}
-
-	handler, err := NewConvoyHandler(fetcher, 8*time.Second, "test-token")
-	if err != nil {
-		t.Fatalf("Failed to create handler: %v", err)
+	api := &browserAPIMock{
+		issueResponse: IssueCreateResponse{Success: true, ID: "gs-new-7", Message: "Created issue: gs-new-7"},
 	}
 
-	ts := httptest.NewServer(handler)
+	ts := newBrowserDashboardServer(t, fetcher, api)
 	defer ts.Close()
 
 	cfg := getBrowserConfig()
@@ -374,24 +336,33 @@ func TestBrowser_ProgressDisplay(t *testing.T) {
 
 	page := browser.MustPage(ts.URL).Timeout(30 * time.Second)
 	defer page.MustClose()
-
 	page.MustWaitLoad()
 
-	bodyText := page.MustElement("body").MustText()
+	page.MustElement(".new-issue-btn").MustClick()
+	waitForEval(t, page, 2*time.Second, `() => document.getElementById('issue-modal')?.style.display === 'flex'`)
 
-	// Verify progress text
-	if !strings.Contains(bodyText, "3/7") {
-		t.Errorf("Expected progress '3/7' in page, got: %s", bodyText[:min(len(bodyText), 500)])
-	}
+	page.MustElement("#issue-title").MustInput("Dashboard modal flow")
+	page.MustElement("#issue-priority").MustSelect("3")
+	page.MustElement("#issue-description").MustInput("Verify modal submit resets state")
+	page.MustElement("#issue-submit-btn").MustClick()
 
-	// Verify progress bar elements exist
-	html := page.MustHTML()
-	if !strings.Contains(html, "progress-bar") {
-		t.Error("Expected progress-bar class in page")
-	}
-	if !strings.Contains(html, "progress-fill") {
-		t.Error("Expected progress-fill class in page")
-	}
+	waitForEval(t, page, 3*time.Second, `() => document.getElementById('issue-modal')?.style.display === 'none'`)
+	waitForEval(t, page, 3*time.Second, `() => document.getElementById('toast-container')?.textContent.includes('gs-new-7')`)
+	waitForEval(t, page, 2*time.Second, `() => document.getElementById('issue-title')?.value === ''`)
 
-	t.Log("PASSED: Progress display works correctly")
+	api.issueMu.Lock()
+	defer api.issueMu.Unlock()
+	if len(api.issueRequests) != 1 {
+		t.Fatalf("Expected exactly one create request, got %d", len(api.issueRequests))
+	}
+	req := api.issueRequests[0]
+	if req.Title != "Dashboard modal flow" {
+		t.Fatalf("Title = %q, want %q", req.Title, "Dashboard modal flow")
+	}
+	if req.Priority != 3 {
+		t.Fatalf("Priority = %d, want 3", req.Priority)
+	}
+	if req.Description != "Verify modal submit resets state" {
+		t.Fatalf("Description = %q, want expected body", req.Description)
+	}
 }

@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -13,6 +15,16 @@ import (
 
 	"github.com/steveyegge/gastown/internal/session"
 )
+
+func writeFakeExecutable(t *testing.T, dir, name, body string) string {
+	t.Helper()
+
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte(body), 0755); err != nil {
+		t.Fatalf("write fake executable %s: %v", name, err)
+	}
+	return path
+}
 
 func TestValidateCommand(t *testing.T) {
 	tests := []struct {
@@ -601,6 +613,55 @@ func TestAPIHandler_IssueCreate_InvalidJSON(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("POST /api/issues/create invalid JSON status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestAPIHandler_IssueCreate_SuccessPassesContractArgs(t *testing.T) {
+	tmpDir := t.TempDir()
+	argsLog := filepath.Join(tmpDir, "bd-args.log")
+
+	writeFakeExecutable(t, tmpDir, "bd", "#!/bin/sh\nprintf '%s\n' \"$@\" > "+argsLog+"\nprintf 'Created issue: gs-new-42\\n'\n")
+	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	handler := NewAPIHandler(30*time.Second, 60*time.Second, "test-token")
+	handler.workDir = tmpDir
+
+	body := `{"title":"--flag-like title","description":"contract body","priority":1}`
+	req := httptest.NewRequest(http.MethodPost, "/api/issues/create", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Dashboard-Token", "test-token")
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("POST /api/issues/create status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	var resp IssueCreateResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("Decode response: %v", err)
+	}
+	if !resp.Success {
+		t.Fatalf("Success = false, error = %q", resp.Error)
+	}
+	if resp.ID != "gs-new-42" {
+		t.Fatalf("ID = %q, want %q", resp.ID, "gs-new-42")
+	}
+
+	rawArgs, err := os.ReadFile(argsLog)
+	if err != nil {
+		t.Fatalf("Read args log: %v", err)
+	}
+	gotArgs := strings.Split(strings.TrimSpace(string(rawArgs)), "\n")
+	wantArgs := []string{"create", "--priority=1", "--body", "contract body", "--", "--flag-like title"}
+	if len(gotArgs) != len(wantArgs) {
+		t.Fatalf("bd args = %v, want %v", gotArgs, wantArgs)
+	}
+	for i := range wantArgs {
+		if gotArgs[i] != wantArgs[i] {
+			t.Fatalf("bd args[%d] = %q, want %q", i, gotArgs[i], wantArgs[i])
+		}
 	}
 }
 
