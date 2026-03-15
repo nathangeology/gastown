@@ -1158,6 +1158,98 @@ func TestFeedNextReadyIssue_SkipsParkedRig(t *testing.T) {
 	}
 }
 
+func TestFeedNextReadyIssue_SkipsParkedRigAndAdvancesToNextReadyIssue(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on windows")
+	}
+
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	convoy := &beadsdk.Issue{
+		ID:        "test-convoy6",
+		Title:     "Convoy Parked Then Advance",
+		Status:    beadsdk.StatusOpen,
+		Priority:  2,
+		IssueType: beadsdk.TypeTask,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	parkedTask := &beadsdk.Issue{
+		ID:        "test-parked6",
+		Title:     "Task On Parked Rig",
+		Status:    beadsdk.StatusOpen,
+		Priority:  2,
+		IssueType: beadsdk.TypeTask,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	activeTask := &beadsdk.Issue{
+		ID:        "test-active6",
+		Title:     "Task On Active Rig",
+		Status:    beadsdk.StatusOpen,
+		Priority:  3,
+		IssueType: beadsdk.TypeTask,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	for _, iss := range []*beadsdk.Issue{convoy, parkedTask, activeTask} {
+		if err := store.CreateIssue(ctx, iss, "test"); err != nil {
+			t.Fatalf("CreateIssue %s: %v", iss.ID, err)
+		}
+	}
+
+	for _, trackedID := range []string{parkedTask.ID, activeTask.ID} {
+		dep := &beadsdk.Dependency{
+			IssueID:     convoy.ID,
+			DependsOnID: trackedID,
+			Type:        beadsdk.DependencyType("tracks"),
+			CreatedAt:   now,
+			CreatedBy:   "test",
+		}
+		if err := store.AddDependency(ctx, dep, "test"); err != nil {
+			t.Fatalf("AddDependency %s: %v", trackedID, err)
+		}
+	}
+
+	townRoot := setupTownRoot(t)
+	gtPath, logPath := makeGTStub(t, 0)
+	logger, logMsgs := makeLogger()
+
+	isRigParked := func(rig string) bool {
+		return rig == "testrig"
+	}
+
+	feedNextReadyIssue(ctx, store, townRoot, convoy.ID, "test", logger, gtPath, isRigParked)
+
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("gt stub was not called for fallback ready issue: %v", err)
+	}
+	logStr := strings.TrimSpace(string(logData))
+	if strings.Contains(logStr, "test-parked6") {
+		t.Fatalf("parked issue should not have been dispatched, got log %q", logStr)
+	}
+	if !strings.Contains(logStr, "sling test-active6 otherrig --no-boot") {
+		t.Fatalf("expected dispatch of active issue after parked skip, got %q", logStr)
+	}
+
+	foundParked := false
+	for _, msg := range *logMsgs {
+		if strings.Contains(msg, "parked") {
+			foundParked = true
+			break
+		}
+	}
+	if !foundParked {
+		t.Fatalf("expected log to mention parked rig skip, got %v", *logMsgs)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // dispatchIssue tests (direct function call)
 // ---------------------------------------------------------------------------
