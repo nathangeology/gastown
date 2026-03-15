@@ -1,4 +1,4 @@
-.PHONY: build desktop-build desktop-run install clean test test-e2e-container check-up-to-date
+.PHONY: build desktop-build desktop-run install clean test test-fast test-integration test-integration-full test-browser test-canary test-e2e-container check-up-to-date
 
 BINARY := gt
 BINARY_DESKTOP := gt-desktop
@@ -9,6 +9,8 @@ E2E_BUILD_FLAGS ?=
 E2E_RUN_FLAGS ?= --rm
 E2E_BUILD_RETRIES ?= 1
 E2E_RUN_RETRIES ?= 1
+GO_TEST ?= go test
+COVERPROFILE ?=
 
 # Get version info for ldflags
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
@@ -98,6 +100,20 @@ clean:
 
 test:
 	go test ./...
+
+test-fast:
+	$(GO_TEST) -race -short -timeout=10m $(if $(COVERPROFILE),-coverprofile=$(COVERPROFILE)) ./...
+
+test-integration:
+	$(GO_TEST) -tags=integration -timeout=15m -v ./internal/cmd/...
+
+test-integration-full:
+	$(GO_TEST) -tags=integration -timeout=20m -v ./...
+
+test-browser:
+	$(GO_TEST) -tags=browser -timeout=10m -v ./internal/web -run TestBrowser
+
+test-canary: test-e2e-container
 
 # Run e2e tests in isolated container (the only supported way to run them)
 test-e2e-container:

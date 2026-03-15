@@ -57,5 +57,6 @@ jobs:
       - name: Build
         run: go build -v ./cmd/gt
 
-      - name: Run all integration tests
-        run: gotestsum --format testname --junitfile junit.xml -- -v -tags=integration -timeout=20m ./...
+      - name: Run full integration lane
+        run: |
+          make test-integration-full GO_TEST='gotestsum --format testname --junitfile junit.xml --'
