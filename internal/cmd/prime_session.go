@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/checkpoint"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/events"
@@ -239,70 +238,10 @@ func detectSessionState(ctx RoleContext) SessionState {
 	// Fallback: query hooked/in_progress beads by assignee.
 	agentID := getAgentIdentity(ctx)
 	if agentID != "" {
-		b := beads.New(ctx.WorkDir)
-		// Primary: agent bead's hook_bead field (authoritative, set by bd slot set during sling)
-		agentBeadID := buildAgentBeadID(agentID, ctx.Role, ctx.TownRoot)
-		if agentBeadID != "" {
-			agentBeadDir := beads.ResolveHookDir(ctx.TownRoot, agentBeadID, ctx.WorkDir)
-			ab := beads.New(agentBeadDir)
-			if agentBead, err := ab.Show(agentBeadID); err == nil && agentBead != nil && agentBead.HookBead != "" {
-				// Resolve and verify the target bead exists with active status
-				// (mirrors molecule_status.go and signal_stop.go patterns)
-				hookBeadDir := beads.ResolveHookDir(ctx.TownRoot, agentBead.HookBead, ctx.WorkDir)
-				hb := beads.New(hookBeadDir)
-				if hookBead, err := hb.Show(agentBead.HookBead); err == nil && hookBead != nil &&
-					(hookBead.Status == beads.StatusHooked || hookBead.Status == "in_progress") {
-					state.State = "autonomous"
-					state.HookedBead = agentBead.HookBead
-					return state
-				}
-			}
-		}
-
-		// Fallback: query by assignee
-		hookedBeads, err := b.List(beads.ListOptions{
-			Status:   beads.StatusHooked,
-			Assignee: agentID,
-			Priority: -1,
-		})
-		if err == nil && len(hookedBeads) > 0 {
+		if hookedBead := resolveAgentWork(ctx, agentID); hookedBead != nil {
 			state.State = "autonomous"
-			state.HookedBead = hookedBeads[0].ID
+			state.HookedBead = hookedBead.ID
 			return state
-		}
-		// Also check in_progress beads
-		inProgressBeads, err := b.List(beads.ListOptions{
-			Status:   "in_progress",
-			Assignee: agentID,
-			Priority: -1,
-		})
-		if err == nil && len(inProgressBeads) > 0 {
-			state.State = "autonomous"
-			state.HookedBead = inProgressBeads[0].ID
-			return state
-		}
-		// Town-level fallback: rig-level agents may have hooked HQ beads
-		// stored in townRoot/.beads. Matches prime.go and molecule_status.go. (gt-dtq7)
-		if !isTownLevelRole(agentID) && ctx.TownRoot != "" {
-			townB := beads.New(filepath.Join(ctx.TownRoot, ".beads"))
-			if townHooked, err := townB.List(beads.ListOptions{
-				Status:   beads.StatusHooked,
-				Assignee: agentID,
-				Priority: -1,
-			}); err == nil && len(townHooked) > 0 {
-				state.State = "autonomous"
-				state.HookedBead = townHooked[0].ID
-				return state
-			}
-			if townIP, err := townB.List(beads.ListOptions{
-				Status:   "in_progress",
-				Assignee: agentID,
-				Priority: -1,
-			}); err == nil && len(townIP) > 0 {
-				state.State = "autonomous"
-				state.HookedBead = townIP[0].ID
-				return state
-			}
 		}
 	}
 

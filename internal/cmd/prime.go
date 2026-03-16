@@ -575,75 +575,7 @@ func findAgentWork(ctx RoleContext) *beads.Issue {
 
 // findAgentWorkOnce performs a single attempt to find hooked work for an agent.
 func findAgentWorkOnce(ctx RoleContext, agentID string) *beads.Issue {
-	// Use rig root for beads queries instead of ctx.WorkDir. Polecat worktrees
-	// rely on .beads/redirect which can fail to resolve in edge cases, causing
-	// polecats to miss hooked work and exit immediately. The rig root directory
-	// always has the authoritative .beads/ database. (GH#2503)
-	b := beads.New(rigBeadsRoot(ctx))
-
-	// Agent bead's hook_bead field. NOTE: updateAgentHookBead was made a no-op
-	// (see sling_helpers.go), so HookBead is typically empty. Kept for backward
-	// compatibility with agent beads that still have hook_bead set.
-	agentBeadID := buildAgentBeadID(agentID, ctx.Role, ctx.TownRoot)
-	if agentBeadID != "" {
-		agentBeadDir := beads.ResolveHookDir(ctx.TownRoot, agentBeadID, ctx.WorkDir)
-		ab := beads.New(agentBeadDir)
-		if agentBead, err := ab.Show(agentBeadID); err == nil && agentBead != nil && agentBead.HookBead != "" {
-			hookBeadDir := beads.ResolveHookDir(ctx.TownRoot, agentBead.HookBead, ctx.WorkDir)
-			hb := beads.New(hookBeadDir)
-			if hookBead, err := hb.Show(agentBead.HookBead); err == nil && hookBead != nil &&
-				(hookBead.Status == beads.StatusHooked || hookBead.Status == "in_progress") {
-				return hookBead
-			}
-		}
-	}
-
-	// Fallback: query by assignee
-	hookedBeads, err := b.List(beads.ListOptions{
-		Status:   beads.StatusHooked,
-		Assignee: agentID,
-		Priority: -1,
-	})
-	if err != nil {
-		return nil
-	}
-
-	// Fall back to in_progress beads (session interrupted before completion)
-	if len(hookedBeads) == 0 {
-		inProgressBeads, err := b.List(beads.ListOptions{
-			Status:   "in_progress",
-			Assignee: agentID,
-			Priority: -1,
-		})
-		if err == nil && len(inProgressBeads) > 0 {
-			hookedBeads = inProgressBeads
-		}
-	}
-
-	// Town-level fallback: rig-level agents (polecats, crew) may have hooked
-	// HQ beads (hq-* prefix) stored in townRoot/.beads, not the rig's database.
-	// Matches the fallback in molecule_status.go and unsling.go. (gt-dtq7)
-	if len(hookedBeads) == 0 && !isTownLevelRole(agentID) && ctx.TownRoot != "" {
-		townB := beads.New(filepath.Join(ctx.TownRoot, ".beads"))
-		if townHooked, err := townB.List(beads.ListOptions{
-			Status:   beads.StatusHooked,
-			Assignee: agentID,
-			Priority: -1,
-		}); err == nil && len(townHooked) > 0 {
-			hookedBeads = townHooked
-		} else if townIP, err := townB.List(beads.ListOptions{
-			Status:   "in_progress",
-			Assignee: agentID,
-			Priority: -1,
-		}); err == nil && len(townIP) > 0 {
-			hookedBeads = townIP
-		}
-	}
-
-	if len(hookedBeads) == 0 {
-		return nil
-	}
-	return hookedBeads[0]
+	return resolveAgentWork(ctx, agentID)
 }
 
 // rigBeadsRoot returns the directory to use for beads queries.

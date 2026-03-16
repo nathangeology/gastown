@@ -370,91 +370,22 @@ func runMoleculeStatus(cmd *cobra.Command, args []string) error {
 	// Called in a retry loop for polecats to handle Dolt propagation lag.
 	lookupHookedWork := func() *beads.Issue {
 		agentBeadID := buildAgentBeadID(target, roleCtx.Role, townRoot)
-
 		if agentBeadID != "" {
-			// Resolve the correct beads directory for the agent bead using prefix-based
-			// routing. This matches how updateAgentHookBead resolves the directory when
-			// setting the hook (via beads.ResolveHookDir).
-			agentBeadPath := beads.ResolveHookDir(townRoot, agentBeadID, workDir)
-			agentB := b
-			if agentBeadPath != workDir {
-				agentB = beads.New(agentBeadPath)
-			}
+			status.AgentBeadID = agentBeadID
+		}
 
-			agentBead, err := agentB.Show(agentBeadID)
-			if err == nil && beads.IsAgentBead(agentBead) {
-				status.AgentBeadID = agentBeadID
+		if hookedBead := resolveAgentWork(roleCtx, target); hookedBead != nil {
+			return hookedBead
+		}
 
-				// Read hook_bead from the agent bead's database field (not description!)
-				// The hook_bead column is updated by `bd slot set` in UpdateAgentState.
-				// IMPORTANT: Don't use ParseAgentFields on description - the description
-				// field may contain stale data, causing the wrong issue to be hooked.
-				if agentBead.HookBead != "" {
-					hookBeadPath := beads.ResolveHookDir(townRoot, agentBead.HookBead, workDir)
-					hookB := b
-					if hookBeadPath != workDir {
-						hookB = beads.New(hookBeadPath)
-					}
-					hookBead, err := hookB.Show(agentBead.HookBead)
-					if err == nil {
-						return hookBead
-					}
-				}
+		// For town-level roles with no local role context, keep the cross-rig scan.
+		if isTownLevelRole(target) {
+			hookedBeads := scanAllRigsForHookedBeads(townRoot, target)
+			if len(hookedBeads) > 0 {
+				return hookedBeads[0]
 			}
 		}
 
-		// FALLBACK: Query for hooked beads (work on agent's hook)
-		// First try status=hooked (work that's been slung but not yet claimed)
-		hookedBeads, err := b.List(beads.ListOptions{
-			Status:   beads.StatusHooked,
-			Assignee: target,
-			Priority: -1,
-		})
-		if err != nil {
-			return nil
-		}
-
-		// If no hooked beads found, also check in_progress beads assigned to this agent.
-		// This handles the case where work was claimed (status changed to in_progress)
-		// but the session was interrupted before completion. The hook should persist.
-		if len(hookedBeads) == 0 {
-			inProgressBeads, _ := b.List(beads.ListOptions{
-				Status:   "in_progress",
-				Assignee: target,
-				Priority: -1,
-			})
-			hookedBeads = inProgressBeads
-		}
-
-		// For town-level roles (mayor, deacon), scan all rigs if nothing found locally
-		if len(hookedBeads) == 0 && isTownLevelRole(target) {
-			hookedBeads = scanAllRigsForHookedBeads(townRoot, target)
-		}
-
-		// For rig-level agents (polecats, crew), also search town-level beads.
-		// When the Mayor slings an hq-* bead to a polecat, the bead lives in
-		// townRoot/.beads, not the rig's .beads database.
-		// See: https://github.com/steveyegge/gastown/issues/1438
-		if len(hookedBeads) == 0 && !isTownLevelRole(target) && townRoot != "" {
-			townB := beads.New(filepath.Join(townRoot, ".beads"))
-			if townHooked, err := townB.List(beads.ListOptions{
-				Status:   beads.StatusHooked,
-				Assignee: target,
-				Priority: -1,
-			}); err == nil && len(townHooked) > 0 {
-				hookedBeads = townHooked
-			} else if townInProgress, err := townB.List(beads.ListOptions{
-				Status:   "in_progress",
-				Assignee: target,
-				Priority: -1,
-			}); err == nil && len(townInProgress) > 0 {
-				hookedBeads = townInProgress
-			}
-		}
-
-		if len(hookedBeads) > 0 {
-			return hookedBeads[0]
-		}
 		return nil
 	}
 
@@ -464,7 +395,8 @@ func runMoleculeStatus(cmd *cobra.Command, args []string) error {
 	var hookBead *beads.Issue
 	isPolecat := roleCtx.Role == RolePolecat ||
 		(os.Getenv("GT_ROLE") != "" && func() bool {
-			r, _, _ := parseRoleString(os.Getenv("GT_ROLE")); return r == RolePolecat
+			r, _, _ := parseRoleString(os.Getenv("GT_ROLE"))
+			return r == RolePolecat
 		}())
 
 	hookBead = lookupHookedWork()
