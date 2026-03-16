@@ -5,10 +5,10 @@ import (
 	"os"
 	"strings"
 
-	"github.com/steveyegge/gastown/internal/cli"
 	"github.com/steveyegge/gastown/internal/config"
-	"github.com/steveyegge/gastown/internal/hookutil"
 	"github.com/steveyegge/gastown/internal/hooks"
+	"github.com/steveyegge/gastown/internal/hookutil"
+	"github.com/steveyegge/gastown/internal/startupmsg"
 	"github.com/steveyegge/gastown/internal/templates/commands"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
@@ -182,12 +182,12 @@ func GetStartupFallbackInfo(rc *config.RuntimeConfig) *StartupFallbackInfo {
 
 // StartupNudgeContent returns the work instructions to send as a startup nudge.
 func StartupNudgeContent() string {
-	return "Check your hook with `" + cli.Name() + " hook`. If work is present, begin immediately."
+	return startupmsg.StartupNudgeInstructions()
 }
 
 // BeaconPrimeInstruction returns the instruction to add to beacon for non-hook agents.
 func BeaconPrimeInstruction() string {
-	return "\n\nRun `" + cli.Name() + " prime` to initialize your context."
+	return "\n\nRun `gt prime` to initialize your context."
 }
 
 // RuntimeConfigWithMinDelay returns a shallow copy of rc with ReadyDelayMs set to

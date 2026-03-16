@@ -32,7 +32,7 @@ func TestSessionDispatchContracts(t *testing.T) {
 				Topic:     "assigned",
 				MolID:     "gs-6ss",
 			},
-			wantBeaconContains: []string{"assigned:gs-6ss", "gt prime --hook", "begin work"},
+			wantBeaconContains: []string{"assigned:gs-6ss", "gt prime --hook", "Execute the hooked work immediately"},
 			wantBeaconNotContains: []string{
 				"Run `gt prime` to initialize your context.",
 			},
@@ -52,7 +52,7 @@ func TestSessionDispatchContracts(t *testing.T) {
 			},
 			wantBeaconContains: []string{"gt prime", "assigned"},
 			wantBeaconNotContains: []string{
-				"begin work",
+				"Execute the hooked work immediately",
 			},
 			wantFallbackCommands:    []string{"gt prime && gt mail check --inject"},
 			wantStartupNudgeContent: runtime.StartupNudgeContent(),
@@ -100,7 +100,7 @@ func TestSessionDispatchContracts(t *testing.T) {
 				IncludePrimeInstruction: true,
 			},
 			wantBeaconContains:      []string{"start", "gt prime"},
-			wantBeaconNotContains:   []string{"begin work"},
+			wantBeaconNotContains:   []string{"Execute the hooked work immediately"},
 			wantFallbackCommands:    []string{"gt prime"},
 			wantStartupNudgeContent: runtime.StartupNudgeContent(),
 		},

@@ -3,16 +3,18 @@ package session
 import (
 	"strings"
 	"testing"
+
+	"github.com/steveyegge/gastown/internal/startupmsg"
 )
 
 func TestBeaconRecipient(t *testing.T) {
 	tests := []struct {
-		name     string
-		role     string
-		agentNm  string
-		rig      string
-		want     string
-		wantNot  []string // must NOT contain these (path separators, etc.)
+		name    string
+		role    string
+		agentNm string
+		rig     string
+		want    string
+		wantNot []string // must NOT contain these (path separators, etc.)
 	}{
 		{
 			name:    "polecat with rig",
@@ -94,6 +96,48 @@ func TestBeaconRecipient(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestStartupInstructionHelpers(t *testing.T) {
+	t.Run("hook and mail", func(t *testing.T) {
+		got := startupmsg.HookAndMailInstructions()
+		want := []string{"gt hook", "gt mail inbox", "Run these commands in order:"}
+		for _, sub := range want {
+			if !strings.Contains(got, sub) {
+				t.Fatalf("HookAndMailInstructions() missing %q in %q", sub, got)
+			}
+		}
+	})
+
+	t.Run("assigned hook", func(t *testing.T) {
+		got := startupmsg.AssignedHookInstructions()
+		want := []string{"gt prime --hook", "gt hook", "Execute the hooked work immediately"}
+		for _, sub := range want {
+			if !strings.Contains(got, sub) {
+				t.Fatalf("AssignedHookInstructions() missing %q in %q", sub, got)
+			}
+		}
+	})
+
+	t.Run("startup nudge", func(t *testing.T) {
+		got := startupmsg.StartupNudgeInstructions()
+		want := []string{"gt hook", "gt mail inbox", "Run these commands now:"}
+		for _, sub := range want {
+			if !strings.Contains(got, sub) {
+				t.Fatalf("StartupNudgeInstructions() missing %q in %q", sub, got)
+			}
+		}
+	})
+
+	t.Run("hooked work start", func(t *testing.T) {
+		got := startupmsg.HookedWorkStartInstructions("gs-7y8", "Replace prompts", "mode=test")
+		want := []string{"gt hook", "bd show gs-7y8", "gs-7y8", "Context: Replace prompts", "Args: mode=test"}
+		for _, sub := range want {
+			if !strings.Contains(got, sub) {
+				t.Fatalf("HookedWorkStartInstructions() missing %q in %q", sub, got)
+			}
+		}
+	})
 }
 
 func TestBeaconRecipientContainsNoPathSeparators(t *testing.T) {
@@ -237,7 +281,8 @@ func TestFormatStartupBeacon(t *testing.T) {
 				"<- deacon",
 				"assigned:gt-abc12",
 				"gt prime --hook",
-				"begin work",
+				"gt hook",
+				"Execute the hooked work immediately",
 			},
 			wantNot: []string{
 				"gastown/crew/gus", // must NOT contain path-like format
@@ -255,7 +300,7 @@ func TestFormatStartupBeacon(t *testing.T) {
 				"deacon",
 				"<- mayor",
 				"cold-start",
-				"Check your hook and mail",
+				"Run these commands in order:",
 				"gt hook",
 				"gt mail inbox",
 			},
@@ -272,7 +317,7 @@ func TestFormatStartupBeacon(t *testing.T) {
 				"witness (rig: gastown)",
 				"<- self",
 				"handoff",
-				"Check your hook and mail",
+				"Run these commands in order:",
 				"gt hook",
 				"gt mail inbox",
 			},

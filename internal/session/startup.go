@@ -2,9 +2,11 @@
 package session
 
 import (
-	"github.com/steveyegge/gastown/internal/cli"
 	"fmt"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/cli"
+	"github.com/steveyegge/gastown/internal/startupmsg"
 )
 
 // BeaconRecipient formats a human-readable, non-path-like recipient for the
@@ -96,11 +98,7 @@ func FormatStartupBeacon(cfg BeaconConfig) string {
 	// For handoff, cold-start, and attach, add explicit instructions so the agent knows
 	// what to do even if hooks haven't loaded CLAUDE.md yet
 	if cfg.Topic == "handoff" || cfg.Topic == "cold-start" || cfg.Topic == "attach" {
-		beacon += "\n\nCheck your hook and mail, then act on the hook if present:\n" +
-			"1. `" + cli.Name() + " hook` - shows hooked work (if any)\n" +
-			"2. `" + cli.Name() + " mail inbox` - check for messages\n" +
-			"3. If work is hooked → execute it immediately\n" +
-			"4. If nothing hooked → wait for instructions"
+		beacon += "\n\n" + startupmsg.HookAndMailInstructions()
 	}
 
 	// For assigned, tell agent to prime then work on the hook.
@@ -108,7 +106,7 @@ func FormatStartupBeacon(cfg BeaconConfig) string {
 	// Matches refinery pattern: short instruction with prime before action.
 	// Exclude work instructions only if explicitly set (non-hook agents get them via delayed nudge)
 	if cfg.Topic == "assigned" && !cfg.ExcludeWorkInstructions {
-		beacon += "\n\nRun `" + cli.Name() + " prime --hook` and begin work on your hook."
+		beacon += "\n\n" + startupmsg.AssignedHookInstructions()
 	}
 
 	return beacon

@@ -384,6 +384,12 @@ func TestStartupNudgeContent(t *testing.T) {
 	if !contains(content, "gt hook") {
 		t.Error("StartupNudgeContent should mention gt hook")
 	}
+	if !contains(content, "gt mail inbox") {
+		t.Error("StartupNudgeContent should mention gt mail inbox")
+	}
+	if !contains(content, "Run these commands now:") {
+		t.Error("StartupNudgeContent should use command-oriented wording")
+	}
 }
 
 func TestEnsureSettingsForRole_CopilotUsesWorkDir(t *testing.T) {
@@ -531,7 +537,7 @@ func TestRuntimeConfigWithMinDelay_NilTmux(t *testing.T) {
 func TestRuntimeConfigWithMinDelay_BelowMin(t *testing.T) {
 	rc := &config.RuntimeConfig{
 		Tmux: &config.RuntimeTmuxConfig{
-			ReadyDelayMs:    500,
+			ReadyDelayMs:      500,
 			ReadyPromptPrefix: "❯ ",
 		},
 	}
