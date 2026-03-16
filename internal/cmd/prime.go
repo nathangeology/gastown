@@ -16,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/cli"
+	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/lock"
 	"github.com/steveyegge/gastown/internal/state"
 	"github.com/steveyegge/gastown/internal/style"
@@ -365,9 +366,32 @@ func setupPrimeSession(ctx RoleContext, roleInfo RoleInfo) error {
 	}
 	if !roleInfo.Mismatch {
 		ensureBeadsRedirect(ctx)
+		ensureRigBeadsBootstrap(ctx)
 	}
 	emitSessionEvent(ctx)
 	return nil
+}
+
+// ensureRigBeadsBootstrap best-effort repairs rig beads metadata and missing
+// server databases before bd prime or hook lookups run in recovered sessions.
+// This lets polecats and crew self-heal after Dolt restarts/crashes without
+// manual metadata surgery.
+func ensureRigBeadsBootstrap(ctx RoleContext) {
+	if ctx.TownRoot == "" || ctx.Rig == "" {
+		return
+	}
+
+	if err := doltserver.EnsureMetadata(ctx.TownRoot, ctx.Rig); err != nil {
+		return
+	}
+
+	for _, ws := range doltserver.FindBrokenWorkspaces(ctx.TownRoot) {
+		if ws.RigName != ctx.Rig {
+			continue
+		}
+		_, _ = doltserver.RepairWorkspace(ctx.TownRoot, ws)
+		return
+	}
 }
 
 // outputRoleContext emits session metadata and all role/context output sections.

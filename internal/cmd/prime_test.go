@@ -14,6 +14,7 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/checkpoint"
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/doltserver"
 )
 
 func writeTestRoutes(t *testing.T, townRoot string, routes []beads.Route) {
@@ -261,6 +262,63 @@ func TestCheckHandoffMarkerDryRun_NoMarker(t *testing.T) {
 	// Verify explain output indicates no marker
 	if !strings.Contains(output, "no handoff marker") {
 		t.Fatalf("expected explain output to indicate no marker, got: %s", output)
+	}
+}
+
+func TestEnsureRigBeadsBootstrapRepairsDatabaseMismatch(t *testing.T) {
+	townRoot := t.TempDir()
+	rigName := "testrig"
+
+	rigBeads := filepath.Join(townRoot, rigName, "mayor", "rig", ".beads")
+	if err := os.MkdirAll(rigBeads, 0755); err != nil {
+		t.Fatalf("mkdir rig beads: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, ".dolt-data", "beads_old-prefix", ".dolt"), 0755); err != nil {
+		t.Fatalf("mkdir stale db: %v", err)
+	}
+
+	metadata := `{
+  "backend": "dolt",
+  "database": "dolt",
+  "dolt_mode": "server",
+  "dolt_database": "beads_old-prefix",
+  "dolt_server_host": "127.0.0.1",
+  "dolt_server_port": 3307
+}
+`
+	if err := os.WriteFile(filepath.Join(rigBeads, "metadata.json"), []byte(metadata), 0600); err != nil {
+		t.Fatalf("write metadata: %v", err)
+	}
+
+	mayorDir := filepath.Join(townRoot, "mayor")
+	if err := os.MkdirAll(mayorDir, 0755); err != nil {
+		t.Fatalf("mkdir mayor: %v", err)
+	}
+	rigsJSON := `{"rigs":{"testrig":{}}}`
+	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(rigsJSON), 0644); err != nil {
+		t.Fatalf("write rigs.json: %v", err)
+	}
+
+	ensureRigBeadsBootstrap(RoleContext{
+		Role:     RolePolecat,
+		Rig:      rigName,
+		TownRoot: townRoot,
+		WorkDir:  filepath.Join(townRoot, rigName, "polecats", "capable"),
+	})
+
+	data, err := os.ReadFile(filepath.Join(rigBeads, "metadata.json"))
+	if err != nil {
+		t.Fatalf("read metadata: %v", err)
+	}
+	var meta map[string]interface{}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		t.Fatalf("parse metadata: %v", err)
+	}
+	if meta["dolt_database"] != rigName {
+		t.Fatalf("dolt_database = %v, want %s", meta["dolt_database"], rigName)
+	}
+	if !doltserver.DatabaseExists(townRoot, rigName) {
+		t.Fatalf("expected repaired database %q to exist", rigName)
 	}
 }
 
@@ -698,29 +756,29 @@ func TestIsCompactResume(t *testing.T) {
 	}()
 
 	cases := []struct {
-		name           string
-		hookSource     string
-		handoffReason  string
-		wantCompact    bool
+		name          string
+		hookSource    string
+		handoffReason string
+		wantCompact   bool
 	}{
 		{
-			name:       "fresh_startup",
-			hookSource: "startup",
+			name:        "fresh_startup",
+			hookSource:  "startup",
 			wantCompact: false,
 		},
 		{
-			name:       "compact_source",
-			hookSource: "compact",
+			name:        "compact_source",
+			hookSource:  "compact",
 			wantCompact: true,
 		},
 		{
-			name:       "resume_source",
-			hookSource: "resume",
+			name:        "resume_source",
+			hookSource:  "resume",
 			wantCompact: true,
 		},
 		{
-			name:       "clear_source",
-			hookSource: "clear",
+			name:        "clear_source",
+			hookSource:  "clear",
 			wantCompact: false,
 		},
 		{

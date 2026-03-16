@@ -1470,6 +1470,51 @@ func TestEnsureMetadata_RepairsMissingDoltFields(t *testing.T) {
 	}
 }
 
+// TestEnsureMetadata_RepairsWrongDatabaseName tests that metadata.json with a
+// stale or cloned dolt_database value is rewritten to the canonical rig name.
+func TestEnsureMetadata_RepairsWrongDatabaseName(t *testing.T) {
+	townRoot := t.TempDir()
+
+	beadsDir := filepath.Join(townRoot, "myrig", "mayor", "rig", ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	metaPath := filepath.Join(beadsDir, "metadata.json")
+	wrong := map[string]interface{}{
+		"backend":          "dolt",
+		"database":         "dolt",
+		"dolt_mode":        "server",
+		"dolt_database":    "beads_old-prefix",
+		"dolt_server_host": "127.0.0.1",
+		"dolt_server_port": DefaultPort,
+		"custom":           "keep-me",
+	}
+	data, _ := json.Marshal(wrong)
+	if err := os.WriteFile(metaPath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := EnsureMetadata(townRoot, "myrig"); err != nil {
+		t.Fatalf("EnsureMetadata failed: %v", err)
+	}
+
+	repaired, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("reading metadata: %v", err)
+	}
+	var meta map[string]interface{}
+	if err := json.Unmarshal(repaired, &meta); err != nil {
+		t.Fatalf("parsing metadata: %v", err)
+	}
+	if meta["dolt_database"] != "myrig" {
+		t.Errorf("dolt_database = %v, want myrig", meta["dolt_database"])
+	}
+	if meta["custom"] != "keep-me" {
+		t.Errorf("custom field not preserved: %v", meta["custom"])
+	}
+}
+
 // TestEnsureMetadata_RepairsStalePort tests that EnsureMetadata overwrites
 // a stale dolt_server_port (e.g., 13729 from a previous bd init) with the
 // correct port from DefaultConfig. This is the root cause of "connection
@@ -1835,7 +1880,6 @@ func TestInitRig_InvalidCharacters(t *testing.T) {
 		}
 	}
 }
-
 
 // =============================================================================
 // Catalog race condition tests (isDoltRetryableError coverage)
