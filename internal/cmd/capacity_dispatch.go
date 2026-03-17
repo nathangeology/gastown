@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 
@@ -303,11 +302,13 @@ func batchFetchBeadInfoByIDs(townRoot string, ids []string) map[string]beadStatu
 	// Most IDs will have a common prefix (e.g., "gt-", "bcc-", "hq-")
 	// For simplicity, try all dirs - bd show will return results only for matching IDs
 	for _, dir := range beadsSearchDirs(townRoot) {
-		// bd show can accept multiple IDs
+		// Use Beads wrapper to get proper BEADS_DIR resolution, --allow-stale,
+		// and BEADS_DOLT_PORT translation (matching how all other bd-invoking
+		// functions work). Raw exec.Command missed these, causing stale/wrong
+		// dolt database queries. See GH#803.
+		b := beads.New(dir)
 		args := append([]string{"show", "--json"}, ids...)
-		showCmd := exec.Command("bd", args...)
-		showCmd.Dir = dir
-		out, err := showCmd.Output()
+		out, err := b.Run(args...)
 		if err != nil {
 			continue
 		}
@@ -490,9 +491,12 @@ func listReadyWorkBeadIDsWithError(townRoot string) (map[string]bool, error) {
 	failCount := 0
 	var lastErr error
 	for _, dir := range dirs {
-		readyCmd := exec.Command("bd", "ready", "--json", "--limit=0")
-		readyCmd.Dir = dir
-		readyOut, err := readyCmd.Output()
+		// Use Beads wrapper to get proper BEADS_DIR resolution, --allow-stale,
+		// and BEADS_DOLT_PORT translation. Raw exec.Command missed these,
+		// causing the scheduler to query stale/wrong dolt databases and return
+		// empty readyWorkIDs. See GH#803.
+		b := beads.New(dir)
+		readyOut, err := b.Run("ready", "--json", "--limit=0")
 		if err != nil {
 			failCount++
 			lastErr = err
@@ -524,4 +528,3 @@ func listReadyWorkBeadIDs(townRoot string) map[string]bool {
 	}
 	return ids
 }
-

@@ -29,6 +29,27 @@ after inspecting tmux pane output for signs of life.
 
 Reference: WAR-ROOM-SERIAL-KILLER.md, commit f3d47a96.
 
+## Scope — What You May and May NOT Touch
+
+**IN SCOPE** (these are the ONLY sessions this plugin may inspect or act on):
+- Polecat sessions (`<rig>-polecat-<name>`)
+- Deacon session (`hq-deacon`)
+
+**OUT OF SCOPE — NEVER touch these, under any circumstances:**
+- **Crew sessions** (`<rig>-crew-<name>`, e.g. `gastown-crew-bear`). Crew lifecycle
+  is managed by the overseer (human), not dogs. Crew members are persistent,
+  long-lived, and user-managed. A crew session that looks idle is NOT stuck — it
+  is waiting for its human. Killing a crew session destroys the overseer's active
+  workspace and is a **critical incident**.
+- **Mayor session** (`hq-mayor`)
+- **Witness sessions** (`<rig>-witness`)
+- **Refinery sessions** (`<rig>-refinery`)
+- Any session not explicitly enumerated by the bash scripts in Steps 1-3
+
+**This scope is absolute.** Do NOT extend it based on your own judgment. The bash
+scripts enumerate exactly the sessions you should check. If a session does not
+appear in `CRASHED[]` or `STUCK[]` arrays, it does not exist for your purposes.
+
 ## Step 1: Enumerate agents to check
 
 Gather all polecats and the deacon session. We check both crashed sessions
@@ -38,15 +59,30 @@ Gather all polecats and the deacon session. We check both crashed sessions
 echo "=== Stuck Agent Dog: Checking agent health ==="
 
 TOWN_ROOT="$HOME/gt"
+RIGS_JSON_PATH="${TOWN_ROOT}/mayor/rigs.json"
 
-# Get all rig names
-RIG_JSON=$(gt rig list --json 2>/dev/null)
-if [ $? -ne 0 ] || [ -z "$RIG_JSON" ]; then
-  echo "SKIP: could not get rig list"
+# Read rigs.json for rig names and beads prefixes
+# CRITICAL: We need both the rig name (for filesystem paths like $TOWN_ROOT/$RIG/polecats/)
+# and the beads prefix (for tmux session names like $PREFIX-polecat-$NAME).
+# These can differ — e.g. rig "cfutons" may have prefix "CF".
+if [ ! -f "$RIGS_JSON_PATH" ]; then
+  echo "SKIP: rigs.json not found at $RIGS_JSON_PATH"
   exit 0
 fi
 
-RIG_NAMES=$(echo "$RIG_JSON" | jq -r '.[].name // empty' 2>/dev/null)
+RIGS_FILE=$(cat "$RIGS_JSON_PATH" 2>/dev/null)
+if [ -z "$RIGS_FILE" ]; then
+  echo "SKIP: could not read rigs.json"
+  exit 0
+fi
+
+# Build a mapping of rig_name -> beads_prefix for session name construction
+# Each line: rig_name|beads_prefix
+RIG_PREFIX_MAP=$(echo "$RIGS_FILE" | jq -r '.rigs | to_entries[] | "\(.key)|\(.value.beads.prefix // .key)"' 2>/dev/null)
+if [ -z "$RIG_PREFIX_MAP" ]; then
+  echo "SKIP: no rigs found in rigs.json"
+  exit 0
+fi
 ```
 
 ## Step 2: Check polecat health
@@ -61,7 +97,8 @@ CRASHED=()
 STUCK=()
 HEALTHY=0
 
-for RIG in $RIG_NAMES; do
+while IFS='|' read -r RIG PREFIX; do
+  [ -z "$RIG" ] && continue
   # List polecat directories
   POLECAT_DIR="$TOWN_ROOT/$RIG/polecats"
   [ -d "$POLECAT_DIR" ] || continue
@@ -69,7 +106,8 @@ for RIG in $RIG_NAMES; do
   for PCAT_PATH in "$POLECAT_DIR"/*/; do
     [ -d "$PCAT_PATH" ] || continue
     PCAT_NAME=$(basename "$PCAT_PATH")
-    SESSION_NAME="${RIG}-polecat-${PCAT_NAME}"
+    # Use beads prefix (not rig name) for tmux session name
+    SESSION_NAME="${PREFIX}-polecat-${PCAT_NAME}"
 
     # Check if session exists
     if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
@@ -114,7 +152,7 @@ for RIG in $RIG_NAMES; do
       fi
     fi
   done
-done
+done <<< "$RIG_PREFIX_MAP"
 
 echo ""
 echo "Health summary: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy"
@@ -158,6 +196,11 @@ fi
 
 **This is the key difference from daemon blind-kill.** For each crashed or stuck
 agent, inspect the tmux pane context to determine if restart is appropriate.
+
+**SCOPE REMINDER: You may ONLY act on entries in the `CRASHED[]` and `STUCK[]`
+arrays populated by Steps 2-3. These arrays contain ONLY polecats and deacon.
+Do NOT inspect, evaluate, or act on ANY other sessions (crew, mayor, witness,
+refinery). If you find yourself considering a session not in these arrays, STOP.**
 
 **You (the dog agent) must evaluate each case:**
 

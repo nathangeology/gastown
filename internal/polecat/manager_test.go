@@ -357,6 +357,7 @@ func TestClearIssueWithoutAssignment(t *testing.T) {
 func TestAddWithOptions_HasAgentsMD(t *testing.T) {
 	// This test verifies that AGENTS.md exists in polecat worktrees after creation.
 	// AGENTS.md is critical for polecats to "land the plane" properly.
+	installMockBd(t)
 
 	root := t.TempDir()
 
@@ -1116,10 +1117,6 @@ func TestAddWithOptions_NoFilesAddedToRepo(t *testing.T) {
 		}
 		// .beads/ is expected - it contains the redirect file for shared beads
 		if strings.Contains(line, ".beads") {
-			continue
-		}
-		// .gitignore is expected - Gas Town patterns added
-		if strings.Contains(line, ".gitignore") {
 			continue
 		}
 		unexpected = append(unexpected, line)

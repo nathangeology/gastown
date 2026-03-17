@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
@@ -59,6 +60,10 @@ func initBeadsDBForServer(t *testing.T, dir, prefix string) {
 	issuesPath := filepath.Join(dir, ".beads", "issues.jsonl")
 	if err := os.WriteFile(issuesPath, []byte(""), 0644); err != nil {
 		t.Fatalf("create issues.jsonl in %s: %v", dir, err)
+	}
+
+	if err := beads.EnsureCustomTypes(filepath.Join(dir, ".beads")); err != nil {
+		t.Fatalf("ensure custom types in %s: %v", dir, err)
 	}
 }
 
@@ -312,7 +317,8 @@ func TestSchedulerAutoConvoyCreation(t *testing.T) {
 
 	// Verify: convoy has a "tracks" dependency pointing to the rig bead.
 	// This is the core cross-rig link: convoy lives in HQ DB, bead in rig DB.
-	depCmd := exec.Command("bd", "dep", "list", fields.Convoy, "--direction=down", "--type=tracks", "--json")
+	depArgs := beads.MaybePrependAllowStale([]string{"dep", "list", fields.Convoy, "--direction=down", "--type=tracks", "--json"})
+	depCmd := exec.Command("bd", depArgs...)
 	depCmd.Dir = hqPath
 	depOut, err := depCmd.Output()
 	if err != nil {
@@ -421,7 +427,8 @@ func TestSchedulerSlingDryRun(t *testing.T) {
 	}
 
 	// Verify: no convoy created (HQ beads DB should have no convoy issues)
-	cmd := exec.Command("bd", "list", "--type=convoy", "--json")
+	listArgs := beads.MaybePrependAllowStale([]string{"list", "--type=convoy", "--json"})
+	cmd := exec.Command("bd", listArgs...)
 	cmd.Dir = hqPath
 	out, err := cmd.Output()
 	if err != nil {
@@ -854,6 +861,10 @@ func TestSchedulerMultiRigConvoyAutoResolve(t *testing.T) {
 	addBeadDependencyOfType(t, convoyID, bead1, "tracks", hqPath)
 	addBeadDependencyOfType(t, convoyID, bead2, "tracks", hqPath)
 
+	// Wait for bd's issues.jsonl timestamp to settle (same race as
+	// TestSchedulerDirectConvoyDispatch — 1-second granularity stale check).
+	time.Sleep(2 * time.Second)
+
 	// Dry-run: verify auto-rig-resolution routes each bead correctly.
 	out := runGTCmdOutput(t, gtBinary, hqPath, env, "sling", convoyID, "--dry-run")
 
@@ -1114,6 +1125,12 @@ func TestSchedulerDirectConvoyDispatch(t *testing.T) {
 	bead2 := createTestBead(t, rig2Path, "Rig2 direct tracked")
 	addBeadDependencyOfType(t, convoyID, bead1, "tracks", hqPath)
 	addBeadDependencyOfType(t, convoyID, bead2, "tracks", hqPath)
+
+	// Wait for bd's issues.jsonl timestamp to settle. bd checks that the Dolt
+	// import timestamp >= jsonl mtime (1-second granularity). Without this,
+	// the sling command flakes with "database out of sync" when the jsonl write
+	// and Dolt import straddle a second boundary.
+	time.Sleep(2 * time.Second)
 
 	// gt sling <convoy-id> --dry-run in direct mode
 	out := runGTCmdOutput(t, gtBinary, hqPath, env, "sling", convoyID, "--dry-run")

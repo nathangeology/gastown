@@ -14,6 +14,7 @@ import (
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/lock"
 	"github.com/steveyegge/gastown/internal/mail"
+	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/telemetry"
 	"github.com/steveyegge/gastown/internal/witness"
@@ -318,7 +319,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 						return fmt.Errorf("%s '%s' cannot be batch-scheduled with an explicit rig\nUse: gt sling %s (children auto-resolve rigs)", idType, id, id)
 					}
 				}
-				return runBatchSchedule(beadIDs, rigName)
+				return runBatchSchedule(beadIDs, rigName, townRoot)
 			}
 			// Explicit rig: print tip about auto-resolve
 			fmt.Printf("  %s the rig can be auto-resolved from bead prefixes. "+
@@ -420,7 +421,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 				}
 			}
 			beadID := args[0]
-			formula := resolveFormula(slingFormula, slingHookRawBead)
+			formula := resolveFormula(slingFormula, slingHookRawBead, townRoot, rigName)
 			return scheduleBead(beadID, rigName, ScheduleOptions{
 				Formula:     formula,
 				Args:        slingArgs,
@@ -446,7 +447,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	if len(args) == 1 {
 		idType, err := detectSchedulerIDType(args[0])
 		if err == nil && idType != "task" {
-			formula := resolveFormula(slingFormula, slingHookRawBead)
+			formula := resolveFormula(slingFormula, slingHookRawBead, townRoot, "")
 
 			switch idType {
 			case "convoy":
@@ -759,7 +760,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 					fmt.Printf("Would set convoy merge strategy: %s\n", slingMerge)
 				}
 			} else {
-				convoyID, err := createAutoConvoy(beadID, info.Title, slingOwned, slingMerge)
+				convoyID, err := createAutoConvoy(beadID, info.Title, slingOwned, slingMerge, slingBaseBranch)
 				if err != nil {
 					// Log warning but don't fail - convoy is optional
 					fmt.Printf("%s Could not create auto-convoy: %v\n", style.Dim.Render("Warning:"), err)
@@ -783,7 +784,11 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	// This ensures polecats get structured work guidance through formula-on-bead.
 	// Use --hook-raw-bead to bypass for expert/debugging scenarios.
 	if formulaName == "" && !slingHookRawBead && strings.Contains(targetAgent, "/polecats/") {
-		formulaName = resolveFormula(slingFormula, false)
+		targetRig := ""
+		if parts := strings.SplitN(targetAgent, "/", 2); len(parts) >= 1 {
+			targetRig = parts[0]
+		}
+		formulaName = resolveFormula(slingFormula, false, townRoot, targetRig)
 		if slingFormula != "" {
 			fmt.Printf("  Applying %s for polecat work...\n", formulaName)
 		} else {
@@ -899,6 +904,20 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 		return err
 	}
 
+	// Emit a propulsion signal if the target is the mayor.
+	// This allows the ACP propeller to react to hook changes event-driven.
+	if targetAgent == "mayor/" {
+		if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
+			session := "hq-mayor"
+			message := fmt.Sprintf("Hook updated: attached bead %s", beadID)
+			_ = nudge.Enqueue(townRoot, session, nudge.QueuedNudge{
+				Sender:   "sling",
+				Message:  message,
+				Priority: nudge.PriorityNormal,
+			})
+		}
+	}
+
 	fmt.Printf("%s Work attached to hook (status=hooked)\n", style.Bold.Render("✓"))
 
 	// Log sling event to activity feed
@@ -919,9 +938,11 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	fieldUpdates := beadFieldUpdates{
 		Dispatcher:       actor,
 		Args:             slingArgs,
+		Vars:             append([]string(nil), slingVars...),
 		AttachedMolecule: attachedMoleculeID,
 		AttachedFormula:  formulaName,
 		NoMerge:          slingNoMerge,
+		FormulaVars:      strings.Join(slingVars, "\n"),
 	}
 	if err := storeFieldsInBead(beadID, fieldUpdates); err != nil {
 		// Warn but don't fail - polecat will still complete work

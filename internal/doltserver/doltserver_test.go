@@ -77,6 +77,170 @@ func TestDirSize_NonexistentDir(t *testing.T) {
 	}
 }
 
+func TestGetDoltFlagFromArgs(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		flag string
+		want string
+	}{
+		{
+			name: "space separated data dir",
+			args: []string{"dolt", "sql-server", "--data-dir", "/tmp/dolt-data"},
+			flag: "--data-dir",
+			want: "/tmp/dolt-data",
+		},
+		{
+			name: "equals data dir",
+			args: []string{"dolt", "sql-server", "--data-dir=/tmp/dolt-data"},
+			flag: "--data-dir",
+			want: "/tmp/dolt-data",
+		},
+		{
+			name: "space separated config",
+			args: []string{"dolt", "sql-server", "--config", "/tmp/.dolt-data/config.yaml"},
+			flag: "--config",
+			want: "/tmp/.dolt-data/config.yaml",
+		},
+		{
+			name: "equals config",
+			args: []string{"dolt", "sql-server", "--config=/tmp/.dolt-data/config.yaml"},
+			flag: "--config",
+			want: "/tmp/.dolt-data/config.yaml",
+		},
+		{
+			name: "missing flag",
+			args: []string{"dolt", "sql-server"},
+			flag: "--config",
+			want: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := getDoltFlagFromArgs(tt.args, tt.flag); got != tt.want {
+				t.Fatalf("getDoltFlagFromArgs(%v, %q) = %q, want %q", tt.args, tt.flag, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDoltProcessMatchesTownPaths(t *testing.T) {
+	expectedDir := "/town/.dolt-data"
+
+	tests := []struct {
+		name             string
+		actualDataDir    string
+		actualConfigPath string
+		actualCWD        string
+		stateDataDir     string
+		want             bool
+	}{
+		{
+			name:          "matches live data dir",
+			actualDataDir: "/town/.dolt-data",
+			want:          true,
+		},
+		{
+			name:             "matches live config path",
+			actualConfigPath: "/town/.dolt-data/config.yaml",
+			want:             true,
+		},
+		{
+			name:      "matches cwd in data dir",
+			actualCWD: "/town/.dolt-data",
+			want:      true,
+		},
+		{
+			name:      "matches cwd in town root",
+			actualCWD: "/town",
+			want:      true,
+		},
+		{
+			name:         "falls back to matching state",
+			stateDataDir: "/town/.dolt-data",
+			want:         true,
+		},
+		{
+			name:             "live config beats stale matching state",
+			actualConfigPath: "/town/juplend_4/.beads/dolt/config.yaml",
+			stateDataDir:     "/town/.dolt-data",
+			want:             false,
+		},
+		{
+			name:         "foreign cwd beats stale matching state",
+			actualCWD:    "/town/juplend_4/.beads/dolt",
+			stateDataDir: "/town/.dolt-data",
+			want:         false,
+		},
+		{
+			name:             "correct config beats unusual cwd",
+			actualConfigPath: "/town/.dolt-data/config.yaml",
+			actualCWD:        "/town/juplend_4/.beads/dolt",
+			want:             true,
+		},
+		{
+			name: "rejects unknown process",
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := doltProcessMatchesTownPaths(expectedDir, tt.actualDataDir, tt.actualConfigPath, tt.actualCWD, tt.stateDataDir)
+			if got != tt.want {
+				t.Fatalf("doltProcessMatchesTownPaths(...) = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDoltProcessOwnerPathFromEvidence(t *testing.T) {
+	tests := []struct {
+		name             string
+		actualDataDir    string
+		actualConfigPath string
+		actualCWD        string
+		stateDataDir     string
+		want             string
+	}{
+		{
+			name:          "prefers live data dir",
+			actualDataDir: "/town/.dolt-data",
+			actualCWD:     "/town",
+			stateDataDir:  "/town/.dolt-data",
+			want:          "/town/.dolt-data",
+		},
+		{
+			name:             "falls back to config path",
+			actualConfigPath: "/town/rig/.beads/dolt/config.yaml",
+			actualCWD:        "/town/rig/.beads/dolt",
+			stateDataDir:     "/town/.dolt-data",
+			want:             "/town/rig/.beads/dolt/config.yaml",
+		},
+		{
+			name:         "falls back to cwd",
+			actualCWD:    "/town/rig/.beads/dolt",
+			stateDataDir: "/town/.dolt-data",
+			want:         "/town/rig/.beads/dolt",
+		},
+		{
+			name:         "falls back to state",
+			stateDataDir: "/town/.dolt-data",
+			want:         "/town/.dolt-data",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := doltProcessOwnerPathFromEvidence(tt.actualDataDir, tt.actualConfigPath, tt.actualCWD, tt.stateDataDir)
+			if got != tt.want {
+				t.Fatalf("doltProcessOwnerPathFromEvidence(...) = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestGetHealthMetrics_NoServer(t *testing.T) {
 	townRoot := t.TempDir()
 
@@ -2273,7 +2437,7 @@ func TestFindBrokenWorkspaces_HealthyWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	broken := FindBrokenWorkspaces(townRoot)
+	broken, _ := FindBrokenWorkspaces(townRoot)
 	if len(broken) != 0 {
 		t.Errorf("expected 0 broken workspaces, got %d: %+v", len(broken), broken)
 	}
@@ -2304,7 +2468,7 @@ func TestFindBrokenWorkspaces_MissingDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	broken := FindBrokenWorkspaces(townRoot)
+	broken, _ := FindBrokenWorkspaces(townRoot)
 	if len(broken) != 1 {
 		t.Fatalf("expected 1 broken workspace, got %d", len(broken))
 	}
@@ -2350,7 +2514,7 @@ func TestFindBrokenWorkspaces_WithLocalData(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	broken := FindBrokenWorkspaces(townRoot)
+	broken, _ := FindBrokenWorkspaces(townRoot)
 	if len(broken) != 1 {
 		t.Fatalf("expected 1 broken workspace, got %d", len(broken))
 	}
@@ -2382,7 +2546,7 @@ func TestFindBrokenWorkspaces_SqliteNotBroken(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	broken := FindBrokenWorkspaces(townRoot)
+	broken, _ := FindBrokenWorkspaces(townRoot)
 	if len(broken) != 0 {
 		t.Errorf("expected 0 broken workspaces for sqlite backend, got %d", len(broken))
 	}
@@ -2423,7 +2587,7 @@ func TestFindBrokenWorkspaces_MultipleRigs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	broken := FindBrokenWorkspaces(townRoot)
+	broken, _ := FindBrokenWorkspaces(townRoot)
 	if len(broken) != 1 {
 		t.Fatalf("expected 1 broken workspace (rig-a only), got %d", len(broken))
 	}
@@ -3403,9 +3567,10 @@ func TestBuildDoltSQLCmd_Remote(t *testing.T) {
 	ctx := t.Context()
 	cmd := buildDoltSQLCmd(ctx, config, "-q", "SELECT 1")
 
-	// Should NOT set Dir for remote
-	if cmd.Dir != "" {
-		t.Errorf("cmd.Dir = %q, want empty for remote", cmd.Dir)
+	// Dir is always set to DataDir — even for remote connections (GH#2537)
+	// to prevent dolt from auto-creating .doltcfg/privileges.db in $CWD.
+	if cmd.Dir != config.DataDir {
+		t.Errorf("cmd.Dir = %q, want %q (DataDir set for remote per GH#2537)", cmd.Dir, config.DataDir)
 	}
 
 	// Should have connection flags
@@ -3835,4 +4000,189 @@ func TestWriteServerConfig_Overwrites(t *testing.T) {
 	if !strings.Contains(string(data), "log_level: info") {
 		t.Error("new config should have updated log level")
 	}
+}
+
+// TestBuildDatabaseToRigMap tests the database name to rig name mapping.
+func TestBuildDatabaseToRigMap(t *testing.T) {
+	townRoot := t.TempDir()
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Test with empty routes file
+	result := buildDatabaseToRigMap(townRoot)
+	if len(result) != 0 {
+		t.Errorf("empty routes: expected empty map, got %v", result)
+	}
+
+	// Test with typical routes.jsonl
+	routesContent := `{"prefix":"hq-","path":"."}
+{"prefix":"bd-","path":"beads/mayor/rig"}
+{"prefix":"gt-","path":"gastown/mayor/rig"}
+{"prefix":"sw-","path":"sallaWork/mayor/rig"}
+{"prefix":"hq-cv-","path":"."}
+`
+	if err := os.WriteFile(filepath.Join(beadsDir, "routes.jsonl"), []byte(routesContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	result = buildDatabaseToRigMap(townRoot)
+
+	// Check expected mappings
+	expected := map[string]string{
+		"bd": "beads",
+		"gt": "gastown",
+		"sw": "sallaWork",
+	}
+
+	for db, rig := range expected {
+		if got, want := result[db], rig; got != want {
+			t.Errorf("database %q: got rig %q, want %q", db, got, want)
+		}
+	}
+
+	// HQ routes with path "." should not be included (path[0] == ".")
+	if _, exists := result["hq"]; exists {
+		t.Error("hq database should not be in map (path is '.')")
+	}
+	if _, exists := result["hq-cv"]; exists {
+		t.Error("hq-cv database should not be in map (path is '.')")
+	}
+}
+
+// TestEnsureAllMetadata_UsesRigNames verifies that EnsureAllMetadata correctly
+// maps database names to rig names using routes.jsonl.
+// This is a regression test for the bug where databases named "bd", "gt", "sw"
+// were incorrectly used as rig names, creating stub directories at /gt/bd/, /gt/gt/, /gt/sw/
+// instead of the correct /gt/beads/, /gt/gastown/, /gt/sallaWork/.
+func TestEnsureAllMetadata_UsesRigNames(t *testing.T) {
+	townRoot := t.TempDir()
+
+	// Create databases in .dolt-data with prefix names (as Dolt server does)
+	dataDir := filepath.Join(townRoot, ".dolt-data")
+	setupDoltDB(t, dataDir, "hq")
+	setupDoltDB(t, dataDir, "bd")
+	setupDoltDB(t, dataDir, "gt")
+
+	// Create routes.jsonl with correct mappings
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	routesContent := `{"prefix":"hq-","path":"."}
+{"prefix":"bd-","path":"beads/mayor/rig"}
+{"prefix":"gt-","path":"gastown/mayor/rig"}
+`
+	if err := os.WriteFile(filepath.Join(beadsDir, "routes.jsonl"), []byte(routesContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create correct rig beads directories (not the buggy stub paths)
+	if err := os.MkdirAll(filepath.Join(townRoot, "beads", "mayor", "rig", ".beads"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, "gastown", "mayor", "rig", ".beads"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run EnsureAllMetadata
+	updated, errs := EnsureAllMetadata(townRoot)
+	if len(errs) > 0 {
+		t.Errorf("unexpected errors: %v", errs)
+	}
+
+	// Verify metadata was created in correct locations
+	hqMeta := filepath.Join(townRoot, ".beads", "metadata.json")
+	beadsMeta := filepath.Join(townRoot, "beads", "mayor", "rig", ".beads", "metadata.json")
+	gastownMeta := filepath.Join(townRoot, "gastown", "mayor", "rig", ".beads", "metadata.json")
+
+	// Buggy paths that should NOT exist
+	buggyBdMeta := filepath.Join(townRoot, "bd", ".beads", "metadata.json")
+	buggyGtMeta := filepath.Join(townRoot, "gt", ".beads", "metadata.json")
+
+	if _, err := os.Stat(hqMeta); os.IsNotExist(err) {
+		t.Error("hq metadata.json should exist")
+	}
+	if _, err := os.Stat(beadsMeta); os.IsNotExist(err) {
+		t.Error("beads metadata.json should exist in correct path")
+	}
+	if _, err := os.Stat(gastownMeta); os.IsNotExist(err) {
+		t.Error("gastown metadata.json should exist in correct path")
+	}
+
+	// Verify buggy paths were NOT created
+	if _, err := os.Stat(buggyBdMeta); err == nil {
+		t.Error("buggy path bd/.beads/metadata.json should NOT exist")
+	}
+	if _, err := os.Stat(buggyGtMeta); err == nil {
+		t.Error("buggy path gt/.beads/metadata.json should NOT exist")
+	}
+
+	// Verify correct number of updates
+	if len(updated) != 3 {
+		t.Errorf("expected 3 updated databases, got %d: %v", len(updated), updated)
+	}
+}
+
+// TestEnsureAllMetadata_FallbackToDbName tests that EnsureAllMetadata falls back
+// to using the database name as rig name when no route is found.
+func TestEnsureAllMetadata_FallbackToDbName(t *testing.T) {
+	townRoot := t.TempDir()
+
+	// Create database
+	dataDir := filepath.Join(townRoot, ".dolt-data")
+	setupDoltDB(t, dataDir, "unknownrig")
+
+	// Create empty routes.jsonl
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "routes.jsonl"), []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create rig beads dir with same name as database
+	if err := os.MkdirAll(filepath.Join(townRoot, "unknownrig", ".beads"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	updated, errs := EnsureAllMetadata(townRoot)
+	if len(errs) > 0 {
+		t.Errorf("unexpected errors: %v", errs)
+	}
+	if len(updated) != 1 {
+		t.Errorf("expected 1 updated, got %d: %v", len(updated), updated)
+	}
+
+	// Verify metadata was created
+	metaPath := filepath.Join(townRoot, "unknownrig", ".beads", "metadata.json")
+	if _, err := os.Stat(metaPath); os.IsNotExist(err) {
+		t.Error("metadata.json should exist for unknown rig")
+	}
+}
+
+func TestCleanStaleSocket_RemovesStaleFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix sockets not applicable on Windows")
+	}
+
+	// Create a regular file pretending to be a stale socket
+	socketPath := filepath.Join(t.TempDir(), "mysql.sock")
+	if err := os.WriteFile(socketPath, []byte{}, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cleanStaleSocket(socketPath)
+
+	// lsof will report exit code 1 (no process holds it) → file should be removed
+	if _, err := os.Stat(socketPath); !os.IsNotExist(err) {
+		t.Error("stale socket file should have been removed")
+	}
+}
+
+func TestCleanStaleSocket_NoopWhenMissing(t *testing.T) {
+	// Should not panic or error when socket doesn't exist
+	cleanStaleSocket(filepath.Join(t.TempDir(), "nonexistent.sock"))
 }

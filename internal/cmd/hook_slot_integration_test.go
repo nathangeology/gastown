@@ -12,8 +12,10 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/testutil"
 )
 
@@ -34,6 +36,21 @@ func setupHookTestTown(t *testing.T) (townRoot, polecatDir, rigPrefix string) {
 
 	townRoot = t.TempDir()
 
+	// Create a real town marker so workspace discovery resolves the outer town
+	// root instead of stopping at the nested rig mayor directory.
+	townMayorDir := filepath.Join(townRoot, "mayor")
+	if err := os.MkdirAll(townMayorDir, 0755); err != nil {
+		t.Fatalf("mkdir town mayor: %v", err)
+	}
+	if err := config.SaveTownConfig(filepath.Join(townMayorDir, "town.json"), &config.TownConfig{
+		Type:      "town",
+		Version:   config.CurrentTownVersion,
+		Name:      "hook-test-town",
+		CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("write town config: %v", err)
+	}
+
 	// Create town-level .beads directory
 	townBeadsDir := filepath.Join(townRoot, ".beads")
 	if err := os.MkdirAll(townBeadsDir, 0755); err != nil {
@@ -42,8 +59,8 @@ func setupHookTestTown(t *testing.T) (townRoot, polecatDir, rigPrefix string) {
 
 	// Create routes.jsonl
 	routes := []beads.Route{
-		{Prefix: "hq-", Path: "."},                           // Town-level beads
-		{Prefix: rigPrefix + "-", Path: "gastown/mayor/rig"}, // Gastown rig
+		{Prefix: "hq-", Path: "."},                             // Town-level beads
+		{Prefix: rigPrefix + "-", Path: "gastown/mayor/rig"},   // Gastown rig
 	}
 	if err := beads.WriteRoutes(townBeadsDir, routes); err != nil {
 		t.Fatalf("write routes: %v", err)
@@ -114,7 +131,7 @@ func TestHookSlot_BasicHook(t *testing.T) {
 	// Create a test bead
 	issue, err := b.Create(beads.CreateOptions{
 		Title:    "Test task for hooking",
-		Type:     "task",
+		Labels:   []string{"gt:task"},
 		Priority: 2,
 	})
 	if err != nil {
@@ -170,7 +187,7 @@ func TestHookSlot_Singleton(t *testing.T) {
 	// Create and hook first bead
 	issue1, err := b.Create(beads.CreateOptions{
 		Title:    "First task",
-		Type:     "task",
+		Labels:   []string{"gt:task"},
 		Priority: 2,
 	})
 	if err != nil {
@@ -187,7 +204,7 @@ func TestHookSlot_Singleton(t *testing.T) {
 	// Create second bead
 	issue2, err := b.Create(beads.CreateOptions{
 		Title:    "Second task",
-		Type:     "task",
+		Labels:   []string{"gt:task"},
 		Priority: 2,
 	})
 	if err != nil {
@@ -243,7 +260,7 @@ func TestHookSlot_Unhook(t *testing.T) {
 	// Create and hook a bead
 	issue, err := b.Create(beads.CreateOptions{
 		Title:    "Task to unhook",
-		Type:     "task",
+		Labels:   []string{"gt:task"},
 		Priority: 2,
 	})
 	if err != nil {
@@ -281,56 +298,6 @@ func TestHookSlot_Unhook(t *testing.T) {
 	}
 }
 
-// TestHookSlot_PersistsAcrossBeadsReload verifies that a hooked assignment
-// survives reloading the beads handle, modeling a fresh session start.
-func TestHookSlot_PersistsAcrossBeadsReload(t *testing.T) {
-	if _, err := exec.LookPath("bd"); err != nil {
-		t.Skip("bd not installed, skipping test")
-	}
-
-	townRoot, polecatDir, rigPrefix := setupHookTestTown(t)
-	_ = townRoot
-
-	rigDir := filepath.Join(polecatDir, "..", "..", "mayor", "rig")
-	initBeadsDBWithPrefix(t, rigDir, rigPrefix)
-
-	b := beads.New(rigDir)
-	issue, err := b.Create(beads.CreateOptions{
-		Title:    "Persistent hooked assignment",
-		Type:     "task",
-		Priority: 2,
-	})
-	if err != nil {
-		t.Fatalf("create issue: %v", err)
-	}
-
-	hooked := beads.StatusHooked
-	assignee := "gastown/polecats/toast"
-	if err := b.Update(issue.ID, beads.UpdateOptions{
-		Status:   &hooked,
-		Assignee: &assignee,
-	}); err != nil {
-		t.Fatalf("hook issue: %v", err)
-	}
-
-	// Re-open the store handle to model a clean session restart.
-	reloaded := beads.New(rigDir)
-	hookedBeads, err := reloaded.List(beads.ListOptions{
-		Status:   beads.StatusHooked,
-		Assignee: assignee,
-		Priority: -1,
-	})
-	if err != nil {
-		t.Fatalf("list hooked beads after reload: %v", err)
-	}
-	if len(hookedBeads) != 1 {
-		t.Fatalf("expected 1 hooked bead after reload, got %d", len(hookedBeads))
-	}
-	if hookedBeads[0].ID != issue.ID {
-		t.Fatalf("hooked bead after reload = %s, want %s", hookedBeads[0].ID, issue.ID)
-	}
-}
-
 // TestHookSlot_DifferentAgents verifies that different agents can have different hooks.
 func TestHookSlot_DifferentAgents(t *testing.T) {
 	if _, err := exec.LookPath("bd"); err != nil {
@@ -356,7 +323,7 @@ func TestHookSlot_DifferentAgents(t *testing.T) {
 	// Create and hook bead to first agent
 	issue1, err := b.Create(beads.CreateOptions{
 		Title:    "Toast's task",
-		Type:     "task",
+		Labels:   []string{"gt:task"},
 		Priority: 2,
 	})
 	if err != nil {
@@ -373,7 +340,7 @@ func TestHookSlot_DifferentAgents(t *testing.T) {
 	// Create and hook bead to second agent
 	issue2, err := b.Create(beads.CreateOptions{
 		Title:    "Nux's task",
-		Type:     "task",
+		Labels:   []string{"gt:task"},
 		Priority: 2,
 	})
 	if err != nil {
@@ -441,7 +408,7 @@ func TestHookSlot_HookPersistence(t *testing.T) {
 	b1 := beads.New(rigDir)
 	issue, err := b1.Create(beads.CreateOptions{
 		Title:    "Persistent task",
-		Type:     "task",
+		Labels:   []string{"gt:task"},
 		Priority: 2,
 	})
 	if err != nil {
@@ -495,7 +462,7 @@ func TestHookSlot_StatusTransitions(t *testing.T) {
 	// Create a bead
 	issue, err := b.Create(beads.CreateOptions{
 		Title:    "Status transition test",
-		Type:     "task",
+		Labels:   []string{"gt:task"},
 		Priority: 2,
 	})
 	if err != nil {

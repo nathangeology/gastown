@@ -234,13 +234,18 @@ func (c *AgentBeadsCheck) Fix(ctx *CheckContext) error {
 		}
 	}
 
-	// fixAgentBead creates the bead if missing (not in issues or wisps).
-	// Uses CreateAgentBead which tries --ephemeral first and falls back to
-	// non-ephemeral if the subprocess crashes (GH#1769: Dolt nil pointer
-	// dereference when wisps table doesn't exist on fresh rigs).
+	// fixAgentBead ensures an agent bead exists and is open.
+	// Logic:
+	//   1. If in issues table → ensure gt:agent label
+	//   2. If in wisps table (open) → ensure gt:agent label
+	//   3. If exists but closed → REOPEN it (don't recreate)
+	//   4. If truly missing → CREATE it
+	// Uses CreateAgentBead which creates agent beads with --no-history
+	// (durable issues, not wisps) so they survive wisp GC (GH#2768).
 	// workDir is the rig directory for direct SQL fallback when bd update
 	// fails silently (e.g., legacy prefixes that can't be routed — GH#2127).
 	fixAgentBead := func(bd *beads.Beads, workDir, id, desc string, fields *beads.AgentFields) error {
+		// Check issues table first
 		if issue, exists := allAgentBeads[id]; exists {
 			// In issues table — ensure it has the gt:agent label.
 			if !beads.HasLabel(issue, "gt:agent") {
@@ -264,11 +269,36 @@ func (c *AgentBeadsCheck) Fix(ctx *CheckContext) error {
 			}
 			return nil
 		}
+
+		// Check wisps table (only open wisps are listed)
 		if allWispIDs[id] {
-			// Already exists as ephemeral wisp — nothing to do
+			// Exists as open wisp — ensure it has gt:agent label
+			// (ListWispIDs doesn't return labels, so we need to check)
+			if issue, err := bd.Show(id); err == nil && issue != nil {
+				if !beads.HasLabel(issue, "gt:agent") {
+					_ = bd.Update(id, beads.UpdateOptions{AddLabels: []string{"gt:agent"}})
+				}
+			}
 			return nil
 		}
-		// Bead missing — create it (CreateAgentBead handles ephemeral fallback)
+
+		// Not in issues or open wisps — check if it exists but is CLOSED
+		if issue, err := bd.Show(id); err == nil && issue != nil {
+			// Bead exists but is closed — REOPEN it instead of recreating
+			if issue.Status == "closed" {
+				openStatus := "open"
+				if err := bd.Update(id, beads.UpdateOptions{Status: &openStatus}); err != nil {
+					return fmt.Errorf("reopening closed agent bead %s: %w", id, err)
+				}
+				// Also ensure it has the gt:agent label
+				if !beads.HasLabel(issue, "gt:agent") {
+					_ = bd.Update(id, beads.UpdateOptions{AddLabels: []string{"gt:agent"}})
+				}
+				return nil
+			}
+		}
+
+		// Bead truly missing — create it (CreateAgentBead handles ephemeral fallback)
 		if _, err := bd.CreateAgentBead(id, desc, fields); err != nil {
 			return fmt.Errorf("creating %s: %w", id, err)
 		}
@@ -380,7 +410,10 @@ func (c *AgentBeadsCheck) Fix(ctx *CheckContext) error {
 	return errors.Join(errs...)
 }
 
-// listCrewWorkers returns the names of all crew workers in a rig.
+// listCrewWorkers returns the names of canonical crew workers in a rig.
+// Filters out git worktrees and other non-identity directories that may
+// exist under <rig>/crew/ (e.g., fix branches, cross-rig worktrees).
+// See GH#2767.
 func listCrewWorkers(townRoot, rigName string) []string {
 	crewDir := filepath.Join(townRoot, rigName, "crew")
 	entries, err := os.ReadDir(crewDir)
@@ -390,9 +423,18 @@ func listCrewWorkers(townRoot, rigName string) []string {
 
 	var workers []string
 	for _, entry := range entries {
-		if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
-			workers = append(workers, entry.Name())
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
 		}
+		// Git worktrees have a .git FILE (not directory) that contains
+		// "gitdir: /path/to/main/.git/worktrees/<name>". Canonical crew
+		// workers have a .git DIRECTORY (they are the main checkout).
+		// Skip directories where .git is a file — they're worktrees.
+		dotGit := filepath.Join(crewDir, entry.Name(), ".git")
+		if info, err := os.Lstat(dotGit); err == nil && !info.IsDir() {
+			continue // .git is a file → this is a worktree, not a crew identity
+		}
+		workers = append(workers, entry.Name())
 	}
 	return workers
 }
@@ -423,7 +465,8 @@ func verifyLabelAdded(workDir, beadID, label string) bool {
 	return strings.Contains(string(output), "1")
 }
 
-// listPolecats returns the names of polecat directories in a rig.
+// listPolecats returns the names of canonical polecat directories in a rig.
+// Filters out git worktrees (same logic as listCrewWorkers). See GH#2767.
 func listPolecats(townRoot, rigName string) []string {
 	polecatDir := filepath.Join(townRoot, rigName, "polecats")
 	entries, err := os.ReadDir(polecatDir)
@@ -433,9 +476,14 @@ func listPolecats(townRoot, rigName string) []string {
 
 	var polecats []string
 	for _, entry := range entries {
-		if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
-			polecats = append(polecats, entry.Name())
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
 		}
+		dotGit := filepath.Join(polecatDir, entry.Name(), ".git")
+		if info, err := os.Lstat(dotGit); err == nil && !info.IsDir() {
+			continue // worktree — skip
+		}
+		polecats = append(polecats, entry.Name())
 	}
 	return polecats
 }

@@ -14,12 +14,14 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/channelevents"
+	"github.com/steveyegge/gastown/internal/cli"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/daemon"
 	"github.com/steveyegge/gastown/internal/formula"
+	rigpkg "github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
-	"github.com/steveyegge/gastown/internal/startupmsg"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/telemetry"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -29,18 +31,14 @@ import (
 // resolveBeadDir returns the directory to run bd commands for a given bead ID.
 // Uses prefix-based routing to find the correct rig directory.
 // Falls back to rigs.json prefix mapping, then town root.
-func resolveBeadDir(beadID string) string {
+func resolveBeadDir(_ string) string {
+	// Always return town root. bd's own prefix routing (routes.jsonl at town
+	// level) handles dispatching to the correct rig database. Returning the
+	// rig path caused bd to discover rig-local .beads/ with broken nested
+	// routing, leading to "bead not found" errors for valid sc-/st-/etc IDs.
 	townRoot, err := workspace.FindFromCwd()
 	if err != nil {
 		return "."
-	}
-	prefix := beads.ExtractPrefix(beadID)
-	if rigPath := beads.GetRigPathForPrefix(townRoot, prefix); rigPath != "" {
-		return rigPath
-	}
-	// Fallback: consult rigs.json for prefix-to-rig mapping
-	if rigDir := resolveBeadDirFromRigsJSON(townRoot, prefix); rigDir != "" {
-		return rigDir
 	}
 	return townRoot
 }
@@ -255,6 +253,7 @@ func getBeadInfo(beadID string) (*beadInfo, error) {
 type beadFieldUpdates struct {
 	Dispatcher       string // Agent that dispatched the work
 	Args             string // Natural language instructions
+	Vars             []string // Formula variables (key=value pairs)
 	AttachedMolecule string // Wisp root ID
 	AttachedFormula  string // Formula name (e.g., "mol-polecat-work") for inline step display
 	NoMerge          bool   // Skip merge queue on completion
@@ -262,6 +261,7 @@ type beadFieldUpdates struct {
 	ConvoyID         string // Convoy bead ID (e.g., "hq-cv-abc")
 	MergeStrategy    string // Convoy merge strategy: "direct", "mr", "local"
 	ConvoyOwned      bool   // Convoy has gt:owned label (caller-managed lifecycle)
+	FormulaVars      string // Newline-separated key=value pairs for formula template substitution
 }
 
 // storeFieldsInBead performs a single read-modify-write to update all attachment fields
@@ -309,6 +309,9 @@ func storeFieldsInBead(beadID string, updates beadFieldUpdates) error {
 	if updates.Args != "" {
 		fields.AttachedArgs = updates.Args
 	}
+	if len(updates.Vars) > 0 {
+		fields.AttachedVars = append([]string(nil), updates.Vars...)
+	}
 	if updates.AttachedMolecule != "" {
 		fields.AttachedMolecule = updates.AttachedMolecule
 		if fields.AttachedAt == "" {
@@ -332,6 +335,9 @@ func storeFieldsInBead(beadID string, updates beadFieldUpdates) error {
 	}
 	if updates.ConvoyOwned {
 		fields.ConvoyOwned = true
+	}
+	if updates.FormulaVars != "" {
+		fields.FormulaVars = updates.FormulaVars
 	}
 
 	// Write back once
@@ -363,7 +369,20 @@ func injectStartPrompt(pane, beadID, subject, args string) error {
 		return nil
 	}
 
-	prompt := startupmsg.HookedWorkStartInstructions(beadID, subject, args)
+	// Build the prompt to inject
+	var prompt string
+	if args != "" {
+		// Args provided - include them prominently in the prompt
+		if subject != "" {
+			prompt = fmt.Sprintf("Work slung: %s (%s). Args: %s. Start working now - use these args to guide your execution.", beadID, subject, args)
+		} else {
+			prompt = fmt.Sprintf("Work slung: %s. Args: %s. Start working now - use these args to guide your execution.", beadID, args)
+		}
+	} else if subject != "" {
+		prompt = fmt.Sprintf("Work slung: %s (%s). Start working on it now - no questions, just begin.", beadID, subject)
+	} else {
+		prompt = fmt.Sprintf("Work slung: %s. Start working on it now - run `"+cli.Name()+" hook` to see the hook, then begin.", beadID)
+	}
 
 	// Use the reliable nudge pattern (same as gt nudge / tmux.NudgeSession)
 	t := tmux.NewTmux()
@@ -587,7 +606,7 @@ func nudgeWitness(rigName, message string) {
 	// Emit a file event so the witness's await-event unblocks instantly.
 	townRoot, _ := workspace.FindFromCwd()
 	if townRoot != "" {
-		_, _ = EmitEventToTown(townRoot, "witness", "POLECAT_DONE", []string{
+		_, _ = channelevents.EmitToTown(townRoot, "witness", "POLECAT_DONE", []string{
 			"source=polecat",
 			"message=" + message,
 		})
@@ -622,7 +641,7 @@ func nudgeRefinery(rigName, message string) {
 	// This is the programmatic bridge between mq submit and the event system.
 	townRoot, _ := workspace.FindFromCwd()
 	if townRoot != "" {
-		_, _ = EmitEventToTown(townRoot, "refinery", "MQ_SUBMIT", []string{
+		_, _ = channelevents.EmitToTown(townRoot, "refinery", "MQ_SUBMIT", []string{
 			"source=sling",
 			"message=" + message,
 		})
@@ -677,7 +696,7 @@ func InstantiateFormulaOnBead(ctx context.Context, formulaName, beadID, title, h
 		if err := BdCmd("cook", formulaName).
 			Dir(formulaWorkDir).
 			WithGTRoot(townRoot).
-			Run(); err != nil {
+				Run(); err != nil {
 			// Retry with embedded formula
 			resolvedFormula, formulaCleanup = resolveFormulaToTempFile(formulaName)
 			if formulaCleanup != nil {
@@ -877,7 +896,7 @@ func ensureFormulaRequiredVars(formulaName string, vars []string) []string {
 		{"setup_command", ""},
 		{"typecheck_command", ""},
 		{"lint_command", ""},
-		{"test_command", "go test ./..."},
+		{"test_command", ""},
 		{"build_command", ""},
 	}
 	for _, item := range requiredDefaults {
@@ -971,7 +990,6 @@ func hookBeadWithRetry(beadID, targetAgent, hookDir string) error {
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		err := BdCmd("update", beadID, "--status=hooked", "--assignee="+targetAgent).
 			Dir(hookDir).
-			WithAutoCommit().
 			Run()
 		if err != nil {
 			lastErr = err
@@ -1060,19 +1078,48 @@ func isSlingConfigError(err error) bool {
 }
 
 // loadRigCommandVars reads rig settings and returns --var key=value strings
-// for all configured build pipeline commands (setup, typecheck, lint, test, build).
-// Only non-empty commands are included; empty means "skip" in the formula.
+// for all configured build pipeline commands (setup, typecheck, lint, test, build)
+// and the default branch (base_branch). Only non-empty values are included.
+//
+// Settings are resolved in priority order:
+//  1. Repository defaults: <rig>/mayor/rig/.gastown/settings.json (committed to git)
+//  2. Rig-local overrides: <rig>/settings/config.json (operator tuning)
+//  3. User --var flags (handled by caller, not here)
 func loadRigCommandVars(townRoot, rig string) []string {
 	if townRoot == "" || rig == "" {
 		return nil
 	}
-	settingsPath := filepath.Join(townRoot, rig, "settings", "config.json")
-	settings, err := config.LoadRigSettings(settingsPath)
-	if err != nil || settings == nil || settings.MergeQueue == nil {
-		return nil
-	}
-	mq := settings.MergeQueue
 	var vars []string
+
+	// Load default_branch from rig root config.json (single source of truth per 5ee9abcc).
+	// This sets base_branch for formula instantiation so polecats fork from the right branch.
+	rigCfg, err := rigpkg.LoadRigConfig(filepath.Join(townRoot, rig))
+	if err == nil && rigCfg != nil && rigCfg.DefaultBranch != "" {
+		vars = append(vars, fmt.Sprintf("base_branch=%s", rigCfg.DefaultBranch))
+	}
+
+	// Load repo-sourced settings (floor — committed to git, always present after clone)
+	var repoMQ *config.MergeQueueConfig
+	repoRoot := filepath.Join(townRoot, rig, "mayor", "rig")
+	repoSettings, _ := config.LoadRepoSettings(repoRoot)
+	if repoSettings != nil {
+		repoMQ = repoSettings.MergeQueue
+	}
+
+	// Load rig-local settings (override — operator tuning)
+	var localMQ *config.MergeQueueConfig
+	settingsPath := filepath.Join(townRoot, rig, "settings", "config.json")
+	localSettings, err := config.LoadRigSettings(settingsPath)
+	if err == nil && localSettings != nil {
+		localMQ = localSettings.MergeQueue
+	}
+
+	// Merge: repo defaults + local overrides
+	mq := config.MergeSettingsCommand(repoMQ, localMQ)
+	if mq == nil {
+		return vars
+	}
+
 	if mq.SetupCommand != "" {
 		vars = append(vars, fmt.Sprintf("setup_command=%s", mq.SetupCommand))
 	}
@@ -1154,4 +1201,31 @@ func updateAgentMode(agentID, mode, workDir, townBeadsDir string) {
 	if err := bd.UpdateAgentDescriptionFields(agentBeadID, beads.AgentFieldUpdates{Mode: &mode}); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: couldn't set agent %s mode: %v\n", agentBeadID, err)
 	}
+}
+
+// lookupPriorAttempt checks if there are existing open MRs for the given issue.
+// If found, returns formula variables with the prior branch name so the new
+// polecat can cherry-pick or reference prior work instead of starting from scratch.
+// Returns nil if no prior attempt exists. (GH#gt-zqvj)
+func lookupPriorAttempt(beadsDir, issueID string) []string {
+	bd := beads.New(beadsDir)
+	mrs, err := bd.FindOpenMRsForIssue(issueID)
+	if err != nil || len(mrs) == 0 {
+		return nil
+	}
+
+	// Use the most recent MR (last in list) as the prior attempt.
+	prior := mrs[len(mrs)-1]
+	fields := beads.ParseMRFields(prior)
+	if fields == nil || fields.Branch == "" {
+		return nil
+	}
+
+	vars := []string{
+		fmt.Sprintf("prior_branch=%s", fields.Branch),
+	}
+	if fields.CloseReason != "" {
+		vars = append(vars, fmt.Sprintf("prior_failure=%s", fields.CloseReason))
+	}
+	return vars
 }

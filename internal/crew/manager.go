@@ -15,6 +15,7 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/session"
@@ -284,6 +285,13 @@ func (m *Manager) addLocked(name string, createBranch bool) (*CrewWorker, error)
 	if err := rig.CopyOverlay(m.rig.Path, crewPath); err != nil {
 		// Non-fatal - log warning but continue
 		style.PrintWarning("could not copy overlay files: %v", err)
+	}
+
+	// Run setup hooks from .runtime/setup-hooks/.
+	// These hooks can inject local config, copy secrets, or perform other setup tasks.
+	if err := rig.RunSetupHooks(m.rig.Path, crewPath); err != nil {
+		// Non-fatal - log warning but continue
+		style.PrintWarning("could not run setup hooks: %v", err)
 	}
 
 	// Ensure .gitignore has required Gas Town patterns
@@ -865,6 +873,16 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 			}
 			_ = t.AcceptStartupDialogs(sessionID)
 		}
+
+		// Start background nudge-queue poller for agents that lack turn-boundary
+		// drain hooks (e.g., Gemini, Codex). Claude drains its queue via
+		// UserPromptSubmit hook so it doesn't need the poller.
+		if preset != nil && !preset.HasTurnBoundaryDrain {
+			if _, pollerErr := nudge.StartPoller(townRoot, sessionID); pollerErr != nil {
+				// Non-fatal — nudges may be delayed but the agent still works.
+				style.PrintWarning("could not start nudge poller for %s: %v", name, pollerErr)
+			}
+		}
 	}
 
 	return nil
@@ -886,6 +904,13 @@ func (m *Manager) Stop(name string) error {
 	}
 	if !running {
 		return ErrSessionNotFound
+	}
+
+	// Stop the background nudge poller before killing the session.
+	// Non-fatal — the poller will exit on its own when the session dies.
+	townRoot := filepath.Dir(m.rig.Path)
+	if pollerErr := nudge.StopPoller(townRoot, sessionID); pollerErr != nil {
+		style.PrintWarning("could not stop nudge poller for %s: %v", name, pollerErr)
 	}
 
 	// Kill the session.
