@@ -1,7 +1,11 @@
 // Package polecat provides polecat lifecycle management.
 package polecat
 
-import "time"
+import (
+	"errors"
+	"fmt"
+	"time"
+)
 
 // State represents the current lifecycle state of a polecat.
 //
@@ -21,8 +25,10 @@ import "time"
 // history) and SANDBOX (worktree) persist across sessions. An idle polecat keeps
 // its worktree so it can be quickly reassigned without creating a new one.
 //
-// "Stalled" and "zombie" are detected conditions, not stored states. The Witness
-// detects them through monitoring (tmux state, age in StateDone, etc.).
+// "Stalled" is a detected condition, not a stored state. The Witness detects it
+// through monitoring (tmux state, heartbeat age, etc.). "Zombie" is both a
+// detected condition AND a stored state — the Witness sets StateZombie when it
+// finds an orphaned session, enabling transition validation.
 type State string
 
 const (
@@ -48,8 +54,9 @@ const (
 	StateStuck State = "stuck"
 
 	// StateZombie means a tmux session exists but has no corresponding worktree directory.
-	// This is a detected condition: the polecat was incompletely nuked or has a
-	// session naming mismatch, leaving an orphaned tmux session.
+	// This is both a detected condition (Witness discovers orphaned sessions) AND a stored
+	// state (set explicitly when detection occurs). The Witness transitions a polecat to
+	// StateZombie when it detects the condition, then to StateIdle after recovery.
 	StateZombie State = "zombie"
 )
 
@@ -61,6 +68,50 @@ func (s State) IsWorking() bool {
 // IsIdle returns true if the polecat has completed work and is available for reuse.
 func (s State) IsIdle() bool {
 	return s == StateIdle
+}
+
+// ErrInvalidTransition is returned when a polecat state transition is not allowed.
+var ErrInvalidTransition = errors.New("invalid polecat state transition")
+
+// ValidPolecatTransitions defines the allowed state transitions for polecat lifecycle.
+//
+// The lifecycle is:
+//
+//	working → done (completed work, called gt done)
+//	working → stuck (explicitly signaled needs help)
+//	working → idle (session killed by witness after work complete)
+//	done → idle (cleanup succeeded, ready for reuse)
+//	done → zombie (cleanup failed, session stuck)
+//	stuck → working (unstuck, resumed work)
+//	stuck → idle (witness killed session)
+//	idle → working (reassigned new work via gt sling)
+//	zombie → idle (witness recovered the zombie)
+//
+// Terminal note: zombie is recoverable (witness can clean it up), so it is not
+// truly terminal. No state is permanently terminal — idle polecats get reused.
+var ValidPolecatTransitions = map[State][]State{
+	StateWorking: {StateDone, StateStuck, StateIdle},
+	StateDone:    {StateIdle, StateZombie},
+	StateStuck:   {StateWorking, StateIdle},
+	StateIdle:    {StateWorking},
+	StateZombie:  {StateIdle},
+}
+
+// ValidatePolecatTransition checks if a state transition is allowed.
+func ValidatePolecatTransition(from, to State) error {
+	if from == to {
+		return nil
+	}
+	allowed, ok := ValidPolecatTransitions[from]
+	if !ok {
+		return fmt.Errorf("%w: unknown state %s", ErrInvalidTransition, from)
+	}
+	for _, target := range allowed {
+		if target == to {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: %s → %s", ErrInvalidTransition, from, to)
 }
 
 // Polecat represents a worker agent in a rig.

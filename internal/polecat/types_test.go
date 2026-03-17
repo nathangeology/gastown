@@ -1,6 +1,8 @@
 package polecat
 
 import (
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -119,5 +121,63 @@ func TestCleanupStatus_CanForceRemove(t *testing.T) {
 				t.Errorf("CleanupStatus(%q).CanForceRemove() = %v, want %v", tt.status, got, tt.expect)
 			}
 		})
+	}
+}
+
+func TestValidatePolecatTransition_Valid(t *testing.T) {
+	for from, targets := range ValidPolecatTransitions {
+		for _, to := range targets {
+			t.Run(fmt.Sprintf("%s→%s", from, to), func(t *testing.T) {
+				if err := ValidatePolecatTransition(from, to); err != nil {
+					t.Errorf("ValidatePolecatTransition(%s, %s) = %v, want nil", from, to, err)
+				}
+			})
+		}
+	}
+}
+
+func TestValidatePolecatTransition_SameState(t *testing.T) {
+	for _, s := range []State{StateWorking, StateIdle, StateDone, StateStuck, StateZombie} {
+		t.Run(string(s), func(t *testing.T) {
+			if err := ValidatePolecatTransition(s, s); err != nil {
+				t.Errorf("same-state transition %s→%s should be allowed: %v", s, s, err)
+			}
+		})
+	}
+}
+
+func TestValidatePolecatTransition_Invalid(t *testing.T) {
+	tests := []struct {
+		from, to State
+	}{
+		{StateIdle, StateZombie},
+		{StateIdle, StateDone},
+		{StateIdle, StateStuck},
+		{StateDone, StateWorking},
+		{StateDone, StateStuck},
+		{StateZombie, StateWorking},
+		{StateZombie, StateDone},
+		{StateWorking, StateZombie},
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%s→%s", tt.from, tt.to), func(t *testing.T) {
+			err := ValidatePolecatTransition(tt.from, tt.to)
+			if err == nil {
+				t.Errorf("ValidatePolecatTransition(%s, %s) = nil, want error", tt.from, tt.to)
+			}
+			if !errors.Is(err, ErrInvalidTransition) {
+				t.Errorf("error should wrap ErrInvalidTransition, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidatePolecatTransition_UnknownState(t *testing.T) {
+	err := ValidatePolecatTransition(State("bogus"), StateWorking)
+	if err == nil {
+		t.Error("expected error for unknown source state")
+	}
+	if !errors.Is(err, ErrInvalidTransition) {
+		t.Errorf("error should wrap ErrInvalidTransition, got: %v", err)
 	}
 }

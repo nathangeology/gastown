@@ -1900,7 +1900,18 @@ func (m *Manager) Get(name string) (*Polecat, error) {
 // This is called after a polecat session successfully starts to transition
 // from "spawning" to "working", making gt polecat identity show accurate status.
 // Valid states: "spawning", "working", "done", "stuck", "idle"
+// Returns ErrInvalidTransition if both current and target states are known
+// lifecycle states and the transition is not allowed.
 func (m *Manager) SetAgentState(name string, state string) error {
+	// Validate transition if target is a known lifecycle state
+	to := State(state)
+	if _, known := ValidPolecatTransitions[to]; known || to == StateZombie {
+		if current, err := m.Get(name); err == nil {
+			if err := ValidatePolecatTransition(current.State, to); err != nil {
+				return err
+			}
+		}
+	}
 	agentID := m.agentBeadID(name)
 	return m.beads.UpdateAgentState(agentID, state)
 }
@@ -1908,9 +1919,18 @@ func (m *Manager) SetAgentState(name string, state string) error {
 // - StateDone: assignee cleared from issue (polecat ready for cleanup)
 // - StateStuck: issue status set to blocked (if supported)
 // If beads is not available, this is a no-op.
+// Returns ErrInvalidTransition if the transition is not allowed.
 func (m *Manager) SetState(name string, state State) error {
 	if !m.exists(name) {
 		return ErrPolecatNotFound
+	}
+
+	// Validate transition against current state
+	current, err := m.Get(name)
+	if err == nil {
+		if err := ValidatePolecatTransition(current.State, state); err != nil {
+			return err
+		}
 	}
 
 	// Find the issue assigned to this polecat
