@@ -20,29 +20,10 @@ var (
 	ErrAlreadyRunning = errors.New("deacon already running")
 )
 
-// tmuxOps abstracts tmux operations for testing.
-type tmuxOps interface {
-	HasSession(name string) (bool, error)
-	IsAgentAlive(session string) bool
-	KillSessionWithProcesses(name string) error
-	NewSessionWithCommand(name, workDir, command string) error
-	SetRemainOnExit(pane string, on bool) error
-	SetEnvironment(session, key, value string) error
-	GetPaneID(session string) (string, error)
-	ConfigureGasTownSession(session string, theme tmux.Theme, rig, worker, role string) error
-	WaitForCommand(session string, excludeCommands []string, timeout time.Duration) error
-	SetAutoRespawnHook(session string) error
-	AcceptStartupDialogs(session string) error
-	AcceptWorkspaceTrustDialog(session string) error
-	AcceptBypassPermissionsWarning(session string) error
-	SendKeysRaw(session, keys string) error
-	GetSessionInfo(name string) (*tmux.SessionInfo, error)
-}
-
 // Manager handles deacon lifecycle operations.
 type Manager struct {
 	townRoot string
-	tmux     tmuxOps
+	tmux     tmux.Client
 }
 
 // NewManager creates a new deacon manager for a town.
