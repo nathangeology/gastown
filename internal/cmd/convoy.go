@@ -468,7 +468,7 @@ func runBdJSON(dir string, args ...string) ([]byte, error) {
 // depType filters by dependency type (e.g., "tracks", "blocks"); empty means all types.
 //
 // Returns deduplicated, unwrapped issue IDs (external:prefix:id → id).
-func bdDepListRawIDs(dir, issueID, direction, depType string) ([]string, error) { //nolint:unparam // depType kept for API generality; callers currently only use "tracks"
+func bdDepListRawIDs(dir, issueID, direction, depType string) ([]string, error) {
 	// Determine query columns based on direction.
 	// "down": issueID depends on targets → SELECT depends_on_id WHERE issue_id = ?
 	// "up":   issueID is depended on → SELECT issue_id WHERE depends_on_id = ?
@@ -707,9 +707,9 @@ func runConvoyCreate(cmd *cobra.Command, args []string) error {
 
 	// Notify address is stored in description (line 166-168) and read from there
 
-	// Run dep add from town root (parent of .beads) so bd routes correctly
-	// across rigs via routes.jsonl. Running from .beads breaks cross-rig routing.
-	townRoot := filepath.Dir(townBeads)
+	// Run dep add from town root so bd routes correctly across rigs via
+	// routes.jsonl. getTownBeadsDir() already returns the town root.
+	// StripBeadsDir prevents inherited BEADS_DIR from overriding routing.
 
 	// Add 'tracks' relations for each tracked issue
 	trackedCount := 0
@@ -718,7 +718,7 @@ func runConvoyCreate(cmd *cobra.Command, args []string) error {
 		var depStderr bytes.Buffer
 		if err := BdCmd("dep", "add", convoyID, issueID, "--type=tracks").
 			WithAutoCommit().
-			Dir(townRoot).
+			Dir(townBeads).
 			StripBeadsDir().
 			Stderr(&depStderr).
 			Run(); err != nil {
@@ -827,16 +827,15 @@ func runConvoyAdd(cmd *cobra.Command, args []string) error {
 		fmt.Printf("%s Reopened convoy %s\n", style.Bold.Render("↺"), convoyID)
 	}
 
-	// Run dep add from town root (parent of .beads) so bd routes correctly
-	// across rigs via routes.jsonl. Running from .beads breaks cross-rig routing.
-	townRoot := filepath.Dir(townBeads)
+	// Run dep add from town root so bd routes correctly across rigs via
+	// routes.jsonl. getTownBeadsDir() already returns the town root.
 
 	// Add 'tracks' relations for each issue
 	addedCount := 0
 	for _, issueID := range issuesToAdd {
 		var depStderr bytes.Buffer
 		if err := BdCmd("dep", "add", convoyID, issueID, "--type=tracks").
-			Dir(townRoot).
+			Dir(townBeads).
 			WithAutoCommit().
 			StripBeadsDir().
 			Stderr(&depStderr).
@@ -1528,7 +1527,6 @@ func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
 		// Town-level beads (hq- prefix with path=".") are excluded because
 		// they can't be dispatched via gt sling -- they're handled by the deacon.
 		// Non-slingable types (epics, convoys, etc.) are also excluded.
-		townRoot := filepath.Dir(townBeads)
 
 		// Batch-check scheduling status for all tracked issues (single DB query).
 		var trackedIDs []string
@@ -1540,7 +1538,7 @@ func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
 		var readyIssues []string
 		for _, t := range tracked {
 			if isReadyIssue(t, scheduledSet) {
-				if !isSlingableBead(townRoot, t.ID) {
+				if !isSlingableBead(townBeads, t.ID) {
 					continue
 				}
 				if !convoyops.IsSlingableType(t.IssueType) {
@@ -1755,8 +1753,7 @@ func notifyConvoyCompletion(townBeads, convoyID, title string) {
 // notifyMayorSession pushes a convoy completion notification into the active
 // Mayor session via nudge, if convoy.notify_on_complete is enabled.
 func notifyMayorSession(townBeads, convoyID, title string) {
-	townRoot := filepath.Dir(townBeads) // townBeads = townRoot/.beads
-	settingsPath := config.TownSettingsPath(townRoot)
+	settingsPath := config.TownSettingsPath(townBeads)
 	settings, err := config.LoadOrCreateTownSettings(settingsPath)
 	if err != nil {
 		return
@@ -2225,19 +2222,26 @@ func applyFreshIssueDetails(dep *trackedDependency, details *issueDetails) {
 // getTrackedIssues gets issues tracked by a convoy with fresh cross-rig details.
 // Returns issue details including status, type, and worker info.
 //
-// Uses bd dep list to query tracked dependencies. If dep list returns empty
-// (e.g., cross-database deps where the JOIN fails — see GH #2624), falls back
-// to bd show and extracts tracked dependencies from the convoy's dependencies
-// array. Then fetches fresh issue details via bd show with prefix routing.
+// Prefers raw SQL query against the dependencies table (bdDepListRawIDs) which
+// avoids the JOIN with the issues table that silently drops cross-database
+// dependencies (see GH #2624, #2832). Falls back to bd dep list and bd show
+// for older bd versions that don't support bd sql.
+// Then fetches fresh issue details via bd show with prefix routing.
 func getTrackedIssues(townBeads, convoyID string) ([]trackedIssueInfo, error) {
-	// Try bd dep list first — the standard dependency query path.
-	trackedIDs, err := bdDepListTracked(townBeads, convoyID)
+	// Prefer raw SQL — works for cross-database deps where tracked beads
+	// live in different Dolt databases. Falls back to bd dep list if bd sql
+	// is not available (older bd versions).
+	trackedIDs, err := bdDepListRawIDs(townBeads, convoyID, "down", "tracks")
 	if err != nil {
-		return nil, fmt.Errorf("querying tracked issues for %s: %w", convoyID, err)
+		// bd sql not supported (older bd) — fall back to bd dep list.
+		trackedIDs, err = bdDepListTracked(townBeads, convoyID)
+		if err != nil {
+			return nil, fmt.Errorf("querying tracked issues for %s: %w", convoyID, err)
+		}
 	}
 
-	// Fallback: when dep list returns empty (common for cross-database deps),
-	// parse tracked dependencies from bd show output.
+	// Fallback: when dep queries return empty (common for cross-database deps
+	// on older bd where the JOIN fails), try parsing from bd show output.
 	if len(trackedIDs) == 0 {
 		trackedIDs, err = bdShowTrackedDeps(townBeads, convoyID)
 		if err != nil {
@@ -2401,9 +2405,8 @@ func (issue issueDetailsJSON) toIssueDetails() *issueDetails {
 // rigName: name of the rig (e.g., "claycantrell")
 // issueID: the issue ID to look up
 func getExternalIssueDetails(townBeads, rigName, issueID string) *issueDetails {
-	// Resolve rig directory path: town parent + rig name
-	townParent := filepath.Dir(townBeads)
-	rigDir := filepath.Join(townParent, rigName)
+	// Resolve rig directory path: townBeads is the town root
+	rigDir := filepath.Join(townBeads, rigName)
 
 	// Check if rig directory exists
 	if _, err := os.Stat(rigDir); os.IsNotExist(err) {
@@ -2475,7 +2478,14 @@ func getIssueDetailsBatch(issueIDs []string) map[string]*issueDetails {
 	args := append([]string{"show"}, issueIDs...)
 	args = append(args, "--json")
 
+	// Run from town root so bd's prefix routing (routes.jsonl) can dispatch
+	// to the correct rig database for cross-rig bead lookups. (GH#2960)
+	townRoot, _ := workspace.FindFromCwdOrError()
 	showCmd := exec.Command("bd", args...)
+	if townRoot != "" {
+		showCmd.Dir = townRoot
+		showCmd.Env = stripEnvKey(os.Environ(), "BEADS_DIR")
+	}
 	var stdout bytes.Buffer
 	showCmd.Stdout = &stdout
 
@@ -2505,8 +2515,16 @@ func getIssueDetailsBatch(issueIDs []string) map[string]*issueDetails {
 // getIssueDetails fetches issue details by trying to show it via bd.
 // Prefer getIssueDetailsBatch for multiple issues to avoid N+1 subprocess calls.
 func getIssueDetails(issueID string) *issueDetails {
-	// Use bd show with routing - it should find the issue in the right rig
+	// Use bd show with routing - resolve from town root so bd's prefix
+	// routing (routes.jsonl) can dispatch to the correct rig database.
+	// Without Dir + StripBeadsDir, bd inherits CWD/BEADS_DIR which may
+	// point to a rig that doesn't contain the target bead. (GH#2960)
+	townRoot, _ := workspace.FindFromCwdOrError()
 	showCmd := exec.Command("bd", "show", issueID, "--json")
+	if townRoot != "" {
+		showCmd.Dir = townRoot
+		showCmd.Env = stripEnvKey(os.Environ(), "BEADS_DIR")
+	}
 	var stdout bytes.Buffer
 	showCmd.Stdout = &stdout
 
