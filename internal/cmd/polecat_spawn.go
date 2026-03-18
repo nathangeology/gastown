@@ -153,6 +153,16 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 		}
 	}
 
+	// Fetch origin once for the entire sling path (gs-4j3). Downstream methods
+	// (addWithOptionsLocked, ReuseIdlePolecat, RepairWorktreeWithOptions) receive
+	// SkipFetch=true so they don't repeat this network round-trip.
+	prof.Begin("spawn/fetch-origin")
+	if repoGit, err := getRigGit(r.Path); err == nil {
+		if err := repoGit.Fetch("origin"); err != nil {
+			style.PrintWarning("could not fetch origin: %v", err)
+		}
+	}
+
 	// Persistent polecat model (gt-4ac): try to reuse an idle polecat first.
 	// Idle polecats have completed their work but kept their sandbox (worktree).
 	// Reusing avoids the overhead of creating a new worktree.
@@ -192,6 +202,7 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 		addOpts := polecat.AddOptions{
 			HookBead:   opts.HookBead,
 			BaseBranch: baseBranch,
+			SkipFetch:  true,
 		}
 		reuseOK := false
 		if _, err := polecatMgr.ReuseIdlePolecat(polecatName, addOpts); err != nil {
@@ -273,6 +284,7 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 	addOpts := polecat.AddOptions{
 		HookBead:   opts.HookBead,
 		BaseBranch: baseBranch,
+		SkipFetch:  true,
 	}
 
 	// No idle polecat available — allocate and create atomically (GH#2215).
