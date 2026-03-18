@@ -279,42 +279,34 @@ func TestIntegration(t *testing.T) {
 		t.Skip("skipping integration test in short mode")
 	}
 
-	// Find a beads repo (use current directory if it has .beads)
-	cwd, err := os.Getwd()
+	// Use an isolated temp database so the test is self-contained and
+	// doesn't depend on a live .beads directory.
+	tmpDir := t.TempDir()
+	b := NewIsolated(tmpDir)
+	if err := b.Init("test"); err != nil {
+		t.Fatalf("bd init: %v", err)
+	}
+
+	// Seed test data: one open issue and one with a dependency (blocked).
+	parent, err := b.Create(CreateOptions{Title: "Parent task", Priority: 1})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Create parent: %v", err)
 	}
-
-	dir := cwd
-	for {
-		if _, err := os.Stat(filepath.Join(dir, ".beads")); err == nil {
-			break
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			t.Skip("no .beads directory found in path")
-		}
-		dir = parent
+	child, err := b.Create(CreateOptions{Title: "Child task", Priority: 2, Parent: parent.ID})
+	if err != nil {
+		t.Fatalf("Create child: %v", err)
 	}
-
-	// Resolve the actual beads directory (following redirect if present)
-	// In multi-worktree setups, worktrees have .beads/redirect pointing to
-	// the canonical beads location (e.g., mayor/rig/.beads)
-	beadsDir := ResolveBeadsDir(dir)
-	doltPath := filepath.Join(beadsDir, "dolt")
-	if _, err := os.Stat(doltPath); os.IsNotExist(err) {
-		t.Skip("no dolt database found")
-	}
-
-	b := New(dir)
 
 	// Test List
 	t.Run("List", func(t *testing.T) {
-		issues, err := b.List(ListOptions{Status: "open"})
+		issues, err := b.List(ListOptions{Priority: -1})
 		if err != nil {
 			t.Fatalf("List failed: %v", err)
 		}
-		t.Logf("Found %d open issues", len(issues))
+		if len(issues) < 2 {
+			t.Fatalf("List returned %d issues, want >= 2", len(issues))
+		}
+		t.Logf("Found %d issues", len(issues))
 	})
 
 	// Test Ready
@@ -335,21 +327,27 @@ func TestIntegration(t *testing.T) {
 		t.Logf("Found %d blocked issues", len(issues))
 	})
 
-	// Test Show (if we have issues)
+	// Test Show
 	t.Run("Show", func(t *testing.T) {
-		issues, err := b.List(ListOptions{})
+		issue, err := b.Show(parent.ID)
 		if err != nil {
-			t.Fatalf("List failed: %v", err)
+			t.Fatalf("Show(%s) failed: %v", parent.ID, err)
 		}
-		if len(issues) == 0 {
-			t.Skip("no issues to show")
-		}
-
-		issue, err := b.Show(issues[0].ID)
-		if err != nil {
-			t.Fatalf("Show(%s) failed: %v", issues[0].ID, err)
+		if issue.Title != "Parent task" {
+			t.Errorf("Show title = %q, want %q", issue.Title, "Parent task")
 		}
 		t.Logf("Showed issue: %s - %s", issue.ID, issue.Title)
+	})
+
+	// Verify child was created with parent relationship
+	t.Run("ShowChild", func(t *testing.T) {
+		issue, err := b.Show(child.ID)
+		if err != nil {
+			t.Fatalf("Show(%s) failed: %v", child.ID, err)
+		}
+		if issue.Title != "Child task" {
+			t.Errorf("Show title = %q, want %q", issue.Title, "Child task")
+		}
 	})
 }
 
@@ -2515,7 +2513,9 @@ func TestSetupRedirect(t *testing.T) {
 // with agent_state="nuked", avoiding the close/reopen cycle
 // that fails on Dolt backends.
 func TestResetAgentBeadForReuse_NukeRespawnCycle(t *testing.T) {
-	t.Skip("bd CLI 0.47.2 bug: database writes don't commit")
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
 
 	tmpDir := t.TempDir()
 	bd := NewIsolated(tmpDir)

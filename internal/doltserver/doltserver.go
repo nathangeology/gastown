@@ -2815,7 +2815,7 @@ func EnsureMetadata(townRoot, rigName string, doltDatabase ...string) error {
 		existing["dolt_mode"] = "server"
 		changed = true
 	}
-	if existing["dolt_database"] == nil || existing["dolt_database"] == "" {
+	if existing["dolt_database"] != effectiveDB {
 		existing["dolt_database"] = effectiveDB
 		changed = true
 	}
