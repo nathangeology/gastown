@@ -293,6 +293,46 @@ func (m *Manager) CheckDoltServerCapacity() error {
 	return nil
 }
 
+// CheckDoltPreSpawn verifies Dolt health and connection capacity in a single SQL
+// round-trip (gs-9na). Replaces the sequential CheckDoltHealth + CheckDoltServerCapacity
+// calls, saving ~50-200ms per spawn. Uses the same retry/backoff logic as CheckDoltHealth
+// for transient failures, and the same fail-closed semantics as CheckDoltServerCapacity.
+func (m *Manager) CheckDoltPreSpawn() error {
+	townRoot, err := workspace.Find(m.rig.Path)
+	if err != nil || townRoot == "" {
+		return nil // Can't determine town root, skip check
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= doltMaxRetries; attempt++ {
+		err := doltserver.CheckPreSpawnHealth(townRoot)
+		if err == nil {
+			return nil
+		}
+		// Connection refused means Dolt isn't running — fail fast like isDoltConfigError
+		if strings.Contains(err.Error(), "connection refused") {
+			return fmt.Errorf("%w: %v", ErrDoltUnhealthy, err)
+		}
+		lastErr = err
+		if attempt < doltMaxRetries {
+			backoff := doltBackoff(attempt)
+			style.PrintWarning("Pre-spawn health check attempt %d failed, retrying in %v...", attempt, backoff)
+			time.Sleep(backoff)
+		}
+	}
+
+	// If the persistent failure looks like read-only, attempt server recovery
+	if lastErr != nil && doltserver.IsReadOnlyError(lastErr.Error()) {
+		if recoverErr := doltserver.RecoverReadOnly(townRoot); recoverErr == nil {
+			if err := doltserver.CheckPreSpawnHealth(townRoot); err == nil {
+				return nil
+			}
+		}
+	}
+
+	return fmt.Errorf("%w: %v", ErrDoltUnhealthy, lastErr)
+}
+
 // createAgentBeadWithRetry wraps CreateOrReopenAgentBead with retry logic.
 // For transient Dolt failures (server exists but write fails), retries with backoff
 // and fails hard — a polecat without an agent bead is untrackable.

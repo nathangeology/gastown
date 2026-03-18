@@ -90,18 +90,12 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 	t := tmux.NewTmux()
 	polecatMgr := polecat.NewManager(r, polecatGit, t)
 
-	// Pre-spawn Dolt health check (gt-94llt7): verify Dolt is reachable before
-	// allocating a polecat. Prevents orphaned polecats when Dolt is down.
-	prof.Begin("spawn/dolt-health")
-	if err := polecatMgr.CheckDoltHealth(); err != nil {
-		return nil, fmt.Errorf("pre-spawn health check failed: %w", err)
-	}
-
-	// Pre-spawn admission control (gt-1obzke): verify Dolt server has connection
-	// capacity before spawning. Prevents connection storms during mass sling.
-	prof.Begin("spawn/dolt-capacity")
-	if err := polecatMgr.CheckDoltServerCapacity(); err != nil {
-		return nil, fmt.Errorf("admission control: %w", err)
+	// Pre-spawn health + capacity check (gs-9na): single SQL round-trip verifies
+	// Dolt is reachable AND has connection capacity. Replaces sequential dolt-health
+	// + dolt-capacity checks, saving ~50-200ms.
+	prof.Begin("spawn/dolt-pre-spawn")
+	if err := polecatMgr.CheckDoltPreSpawn(); err != nil {
+		return nil, fmt.Errorf("pre-spawn check failed: %w", err)
 	}
 
 	// Polecat count cap (clown show #22): refuse to spawn if there are already
