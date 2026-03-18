@@ -1,7 +1,11 @@
 // Package polecat provides polecat lifecycle management.
 package polecat
 
-import "time"
+import (
+	"errors"
+	"fmt"
+	"time"
+)
 
 // State represents the current lifecycle state of a polecat.
 //
@@ -52,6 +56,47 @@ const (
 	// session naming mismatch, leaving an orphaned tmux session.
 	StateZombie State = "zombie"
 )
+
+// ErrInvalidTransition is returned when a polecat state transition is not allowed.
+var ErrInvalidTransition = errors.New("invalid polecat state transition")
+
+// ValidPolecatTransitions defines the allowed state transitions for polecat lifecycle.
+//
+// Lifecycle flow:
+//   - working → idle: normal completion (gt done)
+//   - working → stuck: polecat escalates (gt done --status=ESCALATED)
+//   - working → done: legacy transient state before witness cleanup
+//   - working → zombie: detected by witness (session dead, worktree missing)
+//   - idle → working: re-slung with new work
+//   - done → idle: witness completes cleanup
+//   - stuck → idle: witness resolves stuck polecat
+//   - stuck → working: polecat resumes after help
+//
+// Terminal states: zombie (no transitions out — requires manual intervention).
+var ValidPolecatTransitions = map[State][]State{
+	StateWorking: {StateIdle, StateDone, StateStuck, StateZombie},
+	StateIdle:    {StateWorking},
+	StateDone:    {StateIdle},
+	StateStuck:   {StateIdle, StateWorking},
+	// Terminal: StateZombie has no valid transitions out.
+}
+
+// ValidatePolecatTransition checks if a state transition from → to is valid.
+func ValidatePolecatTransition(from, to State) error {
+	if from == to {
+		return nil
+	}
+	allowed, ok := ValidPolecatTransitions[from]
+	if !ok {
+		return fmt.Errorf("%w: %s is a terminal state", ErrInvalidTransition, from)
+	}
+	for _, target := range allowed {
+		if target == to {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: %s → %s is not allowed", ErrInvalidTransition, from, to)
+}
 
 // IsWorking returns true if the polecat is currently working.
 func (s State) IsWorking() bool {
