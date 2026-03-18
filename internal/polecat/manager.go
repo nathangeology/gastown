@@ -690,6 +690,9 @@ func (m *Manager) AllocateAndAdd(opts AddOptions) (string, *Polecat, error) {
 func (m *Manager) addWithOptionsLocked(name string, opts AddOptions, polecatDir string) (_ *Polecat, retErr error) {
 	defer func() { telemetry.RecordPolecatSpawn(context.Background(), name, retErr) }()
 
+	prof := newManagerProfile()
+	defer prof.report("addWithOptionsLocked")
+
 	clonePath := filepath.Join(polecatDir, m.rig.Name)
 	branchName := m.buildBranchName(name, opts.HookBead)
 
@@ -717,10 +720,12 @@ func (m *Manager) addWithOptionsLocked(name string, opts AddOptions, polecatDir 
 		return nil, fmt.Errorf("finding repo base: %w", err)
 	}
 
+	prof.begin("fetch-origin")
 	if err := repoGit.Fetch("origin"); err != nil {
 		style.PrintWarning("could not fetch origin: %v", err)
 	}
 
+	prof.begin("resolve-startpoint")
 	var startPoint string
 	if opts.BaseBranch != "" {
 		startPoint = opts.BaseBranch
@@ -746,17 +751,20 @@ func (m *Manager) addWithOptionsLocked(name string, opts AddOptions, polecatDir 
 			startPoint, m.rig.Path, filepath.Join(m.rig.Path, ".repo.git"))
 	}
 
+	prof.begin("worktree-add")
 	if err := repoGit.WorktreeAddFromRef(clonePath, branchName, startPoint); err != nil {
 		cleanupOnError()
 		return nil, fmt.Errorf("creating worktree from %s: %w", startPoint, err)
 	}
 	worktreeCreated = true
 
+	prof.begin("setup-shared-beads")
 	if err := m.setupSharedBeads(clonePath); err != nil {
 		cleanupOnError()
 		return nil, fmt.Errorf("setting up shared beads: %w (polecat cannot submit MRs without shared beads)", err)
 	}
 
+	prof.begin("provision-and-overlay")
 	if err := beads.ProvisionPrimeMDForWorktree(clonePath); err != nil {
 		style.PrintWarning("could not provision PRIME.md: %v", err)
 	}
@@ -769,6 +777,7 @@ func (m *Manager) addWithOptionsLocked(name string, opts AddOptions, polecatDir 
 		style.PrintWarning("could not update local git excludes: %v", err)
 	}
 
+	prof.begin("runtime-settings")
 	townRoot := filepath.Dir(m.rig.Path)
 	runtimeConfig := config.ResolveRoleAgentConfig("polecat", townRoot, m.rig.Path)
 	polecatSettingsDir := config.RoleSettingsDir("polecat", m.rig.Path)
@@ -776,10 +785,12 @@ func (m *Manager) addWithOptionsLocked(name string, opts AddOptions, polecatDir 
 		style.PrintWarning("could not install runtime settings: %v", err)
 	}
 
+	prof.begin("setup-hooks")
 	if err := rig.RunSetupHooks(m.rig.Path, clonePath); err != nil {
 		style.PrintWarning("could not run setup hooks: %v", err)
 	}
 
+	prof.begin("agent-bead-create")
 	agentID := m.agentBeadID(name)
 	if err = m.createAgentBeadWithRetry(agentID, &beads.AgentFields{
 		RoleType:   "polecat",

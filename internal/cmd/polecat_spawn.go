@@ -62,7 +62,11 @@ type SlingSpawnOptions struct {
 // This is used by gt sling when the target is a rig name.
 // The caller (sling) handles hook attachment and nudging.
 func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+	prof := NewSlingProfile()
+	defer prof.Report()
+
 	// Find workspace
+	prof.Begin("spawn/find-workspace")
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
 		return nil, fmt.Errorf("not in a Gas Town workspace: %w", err)
@@ -89,12 +93,14 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 
 	// Pre-spawn Dolt health check (gt-94llt7): verify Dolt is reachable before
 	// allocating a polecat. Prevents orphaned polecats when Dolt is down.
+	prof.Begin("spawn/dolt-health")
 	if err := polecatMgr.CheckDoltHealth(); err != nil {
 		return nil, fmt.Errorf("pre-spawn health check failed: %w", err)
 	}
 
 	// Pre-spawn admission control (gt-1obzke): verify Dolt server has connection
 	// capacity before spawning. Prevents connection storms during mass sling.
+	prof.Begin("spawn/dolt-capacity")
 	if err := polecatMgr.CheckDoltServerCapacity(); err != nil {
 		return nil, fmt.Errorf("admission control: %w", err)
 	}
@@ -103,6 +109,7 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 	// too many active polecats. This is a last-resort safety net for the direct-dispatch
 	// path. For configurable capacity gating, use scheduler.max_polecats in town settings
 	// (see internal/scheduler/capacity/).
+	prof.Begin("spawn/cap-checks")
 	const defaultMaxActivePolecats = 25
 	activeCount := countActivePolecats()
 	if activeCount >= defaultMaxActivePolecats {
@@ -149,6 +156,7 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 	// Persistent polecat model (gt-4ac): try to reuse an idle polecat first.
 	// Idle polecats have completed their work but kept their sandbox (worktree).
 	// Reusing avoids the overhead of creating a new worktree.
+	prof.Begin("spawn/find-idle")
 	idlePolecat, findErr := polecatMgr.FindIdlePolecat()
 	if findErr == nil && idlePolecat != nil {
 		polecatName := idlePolecat.Name
@@ -270,6 +278,7 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 	// No idle polecat available — allocate and create atomically (GH#2215).
 	// AllocateAndAdd holds the pool lock through directory creation, preventing
 	// concurrent processes from allocating the same name.
+	prof.Begin("spawn/allocate-and-add")
 	polecatName, _, err := polecatMgr.AllocateAndAdd(addOpts)
 	if err != nil {
 		return nil, fmt.Errorf("allocating and creating polecat: %w", err)
