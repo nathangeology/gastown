@@ -1486,7 +1486,7 @@ exit /b 0
 		t.Fatalf("runSling: %v", err)
 	}
 
-	// Check the molecule log file written by storeFieldsInBead (via GT_TEST_ATTACHED_MOLECULE_LOG).
+	// Check the molecule log file written by hookAndStoreFields (via GT_TEST_ATTACHED_MOLECULE_LOG).
 	// This directly captures the description content without relying on batch stub logging.
 	molBytes, err := os.ReadFile(molLogPath)
 	if err != nil {

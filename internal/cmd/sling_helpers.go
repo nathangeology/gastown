@@ -296,13 +296,29 @@ func storeFieldsInBead(beadID string, updates beadFieldUpdates) error {
 		issue = &issues[0]
 	}
 
-	// Get or create attachment fields
+	newDesc := buildDescriptionWithFields(issue, updates)
+	if logPath != "" {
+		_ = os.WriteFile(logPath, []byte(newDesc), 0644)
+		return nil
+	}
+
+	if err := BdCmd("update", beadID, "--description="+newDesc).
+		Dir(resolveBeadDir(beadID)).
+		StripBeadsDir().
+		Run(); err != nil {
+		return fmt.Errorf("updating bead description: %w", err)
+	}
+
+	return nil
+}
+
+// buildDescriptionWithFields applies field updates to an issue and returns the new description.
+func buildDescriptionWithFields(issue *beads.Issue, updates beadFieldUpdates) string {
 	fields := beads.ParseAttachmentFields(issue)
 	if fields == nil {
 		fields = &beads.AttachmentFields{}
 	}
 
-	// Apply all updates in one pass
 	if updates.Dispatcher != "" {
 		fields.DispatchedBy = updates.Dispatcher
 	}
@@ -340,18 +356,77 @@ func storeFieldsInBead(beadID string, updates beadFieldUpdates) error {
 		fields.FormulaVars = updates.FormulaVars
 	}
 
-	// Write back once
-	newDesc := beads.SetAttachmentFields(issue, fields)
-	if logPath != "" {
-		_ = os.WriteFile(logPath, []byte(newDesc), 0644)
-		return nil
-	}
+	return beads.SetAttachmentFields(issue, fields)
+}
 
-	if err := BdCmd("update", beadID, "--description="+newDesc).
-		Dir(resolveBeadDir(beadID)).
-		StripBeadsDir().
-		Run(); err != nil {
-		return fmt.Errorf("updating bead description: %w", err)
+// hookAndStoreFields combines hookBeadWithRetry and storeFieldsInBead into a single
+// bd update call, reducing 4 Dolt round-trips (hook write, hook verify read, store read,
+// store write) down to 2 (1 read + 1 combined write). The verification read is skipped
+// (trust the write) per the sling performance profile recommendation.
+func hookAndStoreFields(beadID, targetAgent, hookDir string, updates beadFieldUpdates) error {
+	const maxRetries = 10
+	const baseBackoff = 500 * time.Millisecond
+	const maxBackoff = 30 * time.Second
+	logPath := os.Getenv("GT_TEST_ATTACHED_MOLECULE_LOG")
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		// Read the bead once to get current description for field merging.
+		issue := &beads.Issue{}
+		if logPath == "" {
+			out, err := BdCmd("show", beadID, "--json", "--allow-stale").
+				Dir(hookDir).
+				StripBeadsDir().
+				Stderr(io.Discard).
+				Output()
+			if err != nil {
+				if isSlingConfigError(err) {
+					return fmt.Errorf("hooking bead failed (DB not initialized — not retrying): %w", err)
+				}
+				if attempt < maxRetries {
+					backoff := slingBackoff(attempt, baseBackoff, maxBackoff)
+					fmt.Printf("%s Hook+store attempt %d failed (read), retrying in %v...\n", style.Warning.Render("⚠"), attempt, backoff)
+					time.Sleep(backoff)
+					continue
+				}
+				return fmt.Errorf("reading bead for hook+store after %d attempts: %w", maxRetries, err)
+			}
+			if len(out) > 0 {
+				var issues []beads.Issue
+				if err := json.Unmarshal(out, &issues); err == nil && len(issues) > 0 {
+					issue = &issues[0]
+				}
+			}
+		}
+
+		// Build new description with all field updates applied.
+		newDesc := buildDescriptionWithFields(issue, updates)
+		if logPath != "" {
+			_ = os.WriteFile(logPath, []byte(newDesc), 0644)
+			return nil
+		}
+
+		// Single bd update: set status=hooked + assignee + description atomically.
+		err := BdCmd("update", beadID,
+			"--status=hooked",
+			"--assignee="+targetAgent,
+			"--description="+newDesc).
+			Dir(hookDir).
+			StripBeadsDir().
+			Run()
+		if err != nil {
+			if isSlingConfigError(err) {
+				return fmt.Errorf("hooking bead failed (DB not initialized — not retrying): %w", err)
+			}
+			if attempt < maxRetries {
+				backoff := slingBackoff(attempt, baseBackoff, maxBackoff)
+				fmt.Printf("%s Hook+store attempt %d failed, retrying in %v...\n", style.Warning.Render("⚠"), attempt, backoff)
+				time.Sleep(backoff)
+				continue
+			}
+			return fmt.Errorf("hook+store after %d attempts: %w", maxRetries, err)
+		}
+
+		return nil
 	}
 
 	return nil

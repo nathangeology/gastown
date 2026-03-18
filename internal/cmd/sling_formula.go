@@ -176,29 +176,13 @@ func runSlingFormula(ctx context.Context, args []string) error {
 
 	fmt.Printf("%s Wisp created: %s\n", style.Bold.Render("✓"), wispRootID)
 
-	// Step 3: Hook the wisp bead with retry and verification.
-	// See: https://github.com/steveyegge/gastown/issues/148
-	hookDir := beads.ResolveHookDir(townRoot, wispRootID, "")
-	if err := hookBeadWithRetry(wispRootID, targetAgent, hookDir); err != nil {
-		return err
-	}
-	fmt.Printf("%s Attached to hook (status=hooked)\n", style.Bold.Render("✓"))
-
-	// Log sling event to activity feed (formula slinging)
-	actor := detectActor()
-	payload := events.SlingPayload(wispRootID, targetAgent)
-	payload["formula"] = formulaName
-	_ = events.LogFeed(events.TypeSling, actor, payload)
-
-	// Update agent bead's hook_bead field (ZFC: agents track their current work)
-	// Note: formula slinging uses town root as workDir (no polecat-specific path)
-	updateAgentHookBead(targetAgent, wispRootID, "", townBeadsDir)
-
-	// Store all attachment fields in a single read-modify-write cycle.
+	// Step 3: Hook the wisp bead and store attachment fields in a single bd update call.
 	// NOTE: For standalone formula sling, the wisp IS the work - do NOT store
 	// attached_molecule as a self-reference (the wisp's own ID pointing to itself
 	// is meaningless). attached_molecule is only meaningful when a formula-on-bead
 	// creates a wisp that's bonded to a separate base bead.
+	actor := detectActor()
+	hookDir := beads.ResolveHookDir(townRoot, wispRootID, "")
 	fieldUpdates := beadFieldUpdates{
 		Dispatcher:      actor,
 		Args:            slingArgs,
@@ -206,11 +190,22 @@ func runSlingFormula(ctx context.Context, args []string) error {
 		AttachedFormula: formulaName,
 		FormulaVars:     strings.Join(slingVars, "\n"),
 	}
-	if err := storeFieldsInBead(wispRootID, fieldUpdates); err != nil {
-		fmt.Printf("%s Could not store fields in bead: %v\n", style.Dim.Render("Warning:"), err)
-	} else if slingArgs != "" {
+	if err := hookAndStoreFields(wispRootID, targetAgent, hookDir, fieldUpdates); err != nil {
+		return err
+	}
+	fmt.Printf("%s Attached to hook (status=hooked)\n", style.Bold.Render("✓"))
+	if slingArgs != "" {
 		fmt.Printf("%s Args stored in bead (durable)\n", style.Bold.Render("✓"))
 	}
+
+	// Log sling event to activity feed (formula slinging)
+	payload := events.SlingPayload(wispRootID, targetAgent)
+	payload["formula"] = formulaName
+	_ = events.LogFeed(events.TypeSling, actor, payload)
+
+	// Update agent bead's hook_bead field (ZFC: agents track their current work)
+	// Note: formula slinging uses town root as workDir (no polecat-specific path)
+	updateAgentHookBead(targetAgent, wispRootID, "", townBeadsDir)
 
 	// Start delayed dog session now that hook is set
 	// This ensures dog sees the hook when gt prime runs on session start

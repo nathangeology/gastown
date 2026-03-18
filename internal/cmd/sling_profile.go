@@ -94,7 +94,7 @@ func (p *SlingProfile) Report() {
 // isParallelizable returns true for phases that could theoretically run concurrently.
 func isParallelizable(name string) bool {
 	switch name {
-	case "auto-convoy", "formula-cook", "store-fields", "wake-rig-agents":
+	case "auto-convoy", "formula-cook", "wake-rig-agents":
 		return true
 	default:
 		return false

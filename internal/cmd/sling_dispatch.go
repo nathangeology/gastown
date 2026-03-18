@@ -317,25 +317,9 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 	}
 	result.AttachedMolecule = attachedMoleculeID
 
-	// 7. Hook bead with retry
-	hookDir := beads.ResolveHookDir(townRoot, beadToHook, hookWorkDir)
-	if err := hookBeadWithRetry(beadToHook, targetAgent, hookDir); err != nil {
-		// Clean up orphaned polecat to avoid leaving spawned-but-unhookable polecats
-		cleanupSpawnedPolecat(spawnInfo, params.RigName, convoyID)
-		result.ErrMsg = "hook failed"
-		return result, fmt.Errorf("failed to hook bead: %w", err)
-	}
-
-	fmt.Printf("  %s Work attached to %s\n", style.Bold.Render("✓"), spawnInfo.PolecatName)
-
-	// 8. Log sling event
+	// 7. Hook bead and store fields in a single bd update call
 	actor := detectActor()
-	_ = events.LogFeed(events.TypeSling, actor, events.SlingPayload(beadToHook, targetAgent))
-
-	// 9. Update agent hook_bead state
-	updateAgentHookBead(targetAgent, beadToHook, hookWorkDir, beadsDir)
-
-	// 10. Store fields in bead (dispatcher, args, attached_molecule, no_merge, mode)
+	hookDir := beads.ResolveHookDir(townRoot, beadToHook, hookWorkDir)
 	fieldUpdates := beadFieldUpdates{
 		Dispatcher:       actor,
 		Args:             params.Args,
@@ -346,10 +330,20 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		Mode:             params.Mode,
 		FormulaVars:      strings.Join(allVars, "\n"),
 	}
-	// Use beadToHook for the update target (may differ from beadID when formula-on-bead)
-	if err := storeFieldsInBead(beadToHook, fieldUpdates); err != nil {
-		fmt.Printf("  %s Could not store fields in bead: %v\n", style.Dim.Render("Warning:"), err)
+	if err := hookAndStoreFields(beadToHook, targetAgent, hookDir, fieldUpdates); err != nil {
+		// Clean up orphaned polecat to avoid leaving spawned-but-unhookable polecats
+		cleanupSpawnedPolecat(spawnInfo, params.RigName, convoyID)
+		result.ErrMsg = "hook failed"
+		return result, fmt.Errorf("failed to hook bead: %w", err)
 	}
+
+	fmt.Printf("  %s Work attached to %s\n", style.Bold.Render("✓"), spawnInfo.PolecatName)
+
+	// 8. Log sling event
+	_ = events.LogFeed(events.TypeSling, actor, events.SlingPayload(beadToHook, targetAgent))
+
+	// 9. Update agent hook_bead state
+	updateAgentHookBead(targetAgent, beadToHook, hookWorkDir, beadsDir)
 
 	// Update agent bead mode (for stuck detector to identify ralphcats)
 	if params.Mode != "" {

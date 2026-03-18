@@ -906,11 +906,22 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 		// - Base bead left orphaned after gt done
 	}
 
-	// Hook the bead with retry and verification.
+	// Hook the bead and store attachment fields in a single bd update call.
+	// Combines hook-bead + store-fields phases into 1 read + 1 write (was 4 Dolt ops).
 	// See: https://github.com/steveyegge/gastown/issues/148
 	prof.Begin("hook-bead")
+	actor := detectActor()
 	hookDir := beads.ResolveHookDir(townRoot, beadID, hookWorkDir)
-	if err := hookBeadWithRetry(beadID, targetAgent, hookDir); err != nil {
+	fieldUpdates := beadFieldUpdates{
+		Dispatcher:       actor,
+		Args:             slingArgs,
+		Vars:             append([]string(nil), slingVars...),
+		AttachedMolecule: attachedMoleculeID,
+		AttachedFormula:  formulaName,
+		NoMerge:          slingNoMerge,
+		FormulaVars:      strings.Join(slingVars, "\n"),
+	}
+	if err := hookAndStoreFields(beadID, targetAgent, hookDir, fieldUpdates); err != nil {
 		return err
 	}
 
@@ -931,7 +942,6 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	fmt.Printf("%s Work attached to hook (status=hooked)\n", style.Bold.Render("✓"))
 
 	// Log sling event to activity feed
-	actor := detectActor()
 	_ = events.LogFeed(events.TypeSling, actor, events.SlingPayload(beadID, targetAgent))
 
 	// Update agent bead's hook_bead field (ZFC: agents track their current work)
@@ -942,29 +952,11 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 		updateAgentHookBead(targetAgent, beadID, hookWorkDir, townBeadsDir)
 	}
 
-	// Store all attachment fields in a single read-modify-write cycle.
-	// This eliminates the race condition where sequential independent updates
-	// (dispatcher, args, no_merge, attached_molecule) could overwrite each other.
-	prof.Begin("store-fields")
-	fieldUpdates := beadFieldUpdates{
-		Dispatcher:       actor,
-		Args:             slingArgs,
-		Vars:             append([]string(nil), slingVars...),
-		AttachedMolecule: attachedMoleculeID,
-		AttachedFormula:  formulaName,
-		NoMerge:          slingNoMerge,
-		FormulaVars:      strings.Join(slingVars, "\n"),
+	if slingArgs != "" {
+		fmt.Printf("%s Args stored in bead (durable)\n", style.Bold.Render("✓"))
 	}
-	if err := storeFieldsInBead(beadID, fieldUpdates); err != nil {
-		// Warn but don't fail - polecat will still complete work
-		fmt.Printf("%s Could not store fields in bead: %v\n", style.Dim.Render("Warning:"), err)
-	} else {
-		if slingArgs != "" {
-			fmt.Printf("%s Args stored in bead (durable)\n", style.Bold.Render("✓"))
-		}
-		if slingNoMerge {
-			fmt.Printf("%s No-merge mode enabled (work stays on feature branch)\n", style.Bold.Render("✓"))
-		}
+	if slingNoMerge {
+		fmt.Printf("%s No-merge mode enabled (work stays on feature branch)\n", style.Bold.Render("✓"))
 	}
 
 	// Start delayed dog session now that hook is set
