@@ -758,8 +758,11 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	}
 
 	// Auto-convoy: check if issue is already tracked by a convoy
-	// If not, create one for dashboard visibility (unless --no-convoy is set)
+	// If not, create one for dashboard visibility (unless --no-convoy is set).
+	// Convoy creation is deferred to a background goroutine since it involves
+	// 2 Dolt writes that are not on the critical path (gs-008).
 	prof.Begin("auto-convoy")
+	var convoyFut *convoyFuture
 	if !slingNoConvoy && formulaName == "" {
 		existingConvoy := isTrackedByConvoy(beadID)
 		if existingConvoy == "" {
@@ -770,20 +773,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 					fmt.Printf("Would set convoy merge strategy: %s\n", slingMerge)
 				}
 			} else {
-				convoyID, err := createAutoConvoy(beadID, info.Title, slingOwned, slingMerge, slingBaseBranch)
-				if err != nil {
-					// Log warning but don't fail - convoy is optional
-					fmt.Printf("%s Could not create auto-convoy: %v\n", style.Dim.Render("Warning:"), err)
-				} else {
-					fmt.Printf("%s Created convoy 🚚 %s\n", style.Bold.Render("→"), convoyID)
-					fmt.Printf("  Tracking: %s\n", beadID)
-					if slingOwned {
-						fmt.Printf("  Lifecycle: caller-managed (owned)\n")
-					}
-					if slingMerge != "" {
-						fmt.Printf("  Merge:    %s\n", slingMerge)
-					}
-				}
+				convoyFut = createAutoConvoyAsync(beadID, info.Title, slingOwned, slingMerge, slingBaseBranch)
 			}
 		} else {
 			fmt.Printf("%s Already tracked by convoy %s\n", style.Dim.Render("○"), existingConvoy)
@@ -960,6 +950,22 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	}
 	if slingNoMerge {
 		fmt.Printf("%s No-merge mode enabled (work stays on feature branch)\n", style.Bold.Render("✓"))
+	}
+
+	// Collect background convoy result (non-blocking if already done).
+	if convoyFut != nil {
+		if convoyID, err := convoyFut.Wait(); err != nil {
+			fmt.Printf("%s Could not create auto-convoy: %v\n", style.Dim.Render("Warning:"), err)
+		} else {
+			fmt.Printf("%s Created convoy 🚚 %s\n", style.Bold.Render("→"), convoyID)
+			fmt.Printf("  Tracking: %s\n", beadID)
+			if slingOwned {
+				fmt.Printf("  Lifecycle: caller-managed (owned)\n")
+			}
+			if slingMerge != "" {
+				fmt.Printf("  Merge:    %s\n", slingMerge)
+			}
+		}
 	}
 
 	// Start delayed dog session now that hook is set

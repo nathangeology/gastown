@@ -16,6 +16,49 @@ import (
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
+// convoyFuture holds the result of an async convoy creation.
+// Call Wait() to block until the result is available.
+type convoyFuture struct {
+	done chan struct{}
+	id   string
+	err  error
+}
+
+// Wait blocks until the convoy creation completes and returns the convoy ID.
+func (f *convoyFuture) Wait() (string, error) {
+	if f == nil {
+		return "", nil
+	}
+	<-f.done
+	return f.id, f.err
+}
+
+// ID returns the convoy ID if available, empty string otherwise. Non-blocking.
+func (f *convoyFuture) ID() string {
+	if f == nil {
+		return ""
+	}
+	select {
+	case <-f.done:
+		return f.id
+	default:
+		return ""
+	}
+}
+
+// createAutoConvoyAsync launches createAutoConvoy in a background goroutine
+// and returns a future. The caller can continue with other work and collect
+// the convoy ID later via future.Wait(). This removes ~200-500ms of Dolt
+// writes from the critical sling path.
+func createAutoConvoyAsync(beadID, beadTitle string, owned bool, mergeStrategy, baseBranch string) *convoyFuture {
+	f := &convoyFuture{done: make(chan struct{})}
+	go func() {
+		defer close(f.done)
+		f.id, f.err = createAutoConvoy(beadID, beadTitle, owned, mergeStrategy, baseBranch)
+	}()
+	return f
+}
+
 // slingGenerateShortID generates a short random ID (5 lowercase chars).
 func slingGenerateShortID() string {
 	b := make([]byte, 3)

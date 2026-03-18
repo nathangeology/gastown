@@ -243,18 +243,14 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 	targetAgent := spawnInfo.AgentID()
 	hookWorkDir := spawnInfo.ClonePath
 
-	// 4. Auto-convoy (if !NoConvoy)
-	convoyID := ""
+	// 4. Auto-convoy (if !NoConvoy) — deferred to background goroutine (gs-008).
+	// The convoy ID is only needed for rollback cleanup and field storage,
+	// both of which happen later in the pipeline.
+	var convoyFut *convoyFuture
 	if !params.NoConvoy {
 		existingConvoy := isTrackedByConvoy(params.BeadID)
 		if existingConvoy == "" {
-			var err error
-			convoyID, err = createAutoConvoy(params.BeadID, info.Title, params.Owned, params.Merge, params.BaseBranch)
-			if err != nil {
-				fmt.Printf("  %s Could not create auto-convoy: %v\n", style.Dim.Render("Warning:"), err)
-			} else {
-				fmt.Printf("  %s Created convoy %s\n", style.Bold.Render("→"), convoyID)
-			}
+			convoyFut = createAutoConvoyAsync(params.BeadID, info.Title, params.Owned, params.Merge, params.BaseBranch)
 		} else {
 			fmt.Printf("  %s Already tracked by convoy %s\n", style.Dim.Render("○"), existingConvoy)
 		}
@@ -266,8 +262,9 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		workDir := beads.ResolveHookDir(townRoot, params.BeadID, hookWorkDir)
 		if err := CookFormula(params.FormulaName, workDir, townRoot); err != nil {
 			if params.FormulaFailFatal {
-				// Rollback spawned polecat on fatal cook failure
-				rollbackSlingArtifactsFn(spawnInfo, params.BeadID, hookWorkDir, convoyID)
+				// Rollback spawned polecat on fatal cook failure.
+				// Use convoyFut.ID() for best-effort cleanup (non-blocking).
+				rollbackSlingArtifactsFn(spawnInfo, params.BeadID, hookWorkDir, convoyFut.ID())
 				result.ErrMsg = fmt.Sprintf("cook failed: %v", err)
 				return result, fmt.Errorf("cooking formula %s: %w", params.FormulaName, err)
 			}
@@ -301,8 +298,9 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		formulaResult, err := InstantiateFormulaOnBead(context.Background(), params.FormulaName, params.BeadID, info.Title, hookWorkDir, townRoot, true, allVars)
 		if err != nil {
 			if params.FormulaFailFatal {
-				// Rollback spawned polecat on fatal formula failure
-				rollbackSlingArtifactsFn(spawnInfo, params.BeadID, hookWorkDir, convoyID)
+				// Rollback spawned polecat on fatal formula failure.
+				// Use convoyFut.ID() for best-effort cleanup (non-blocking).
+				rollbackSlingArtifactsFn(spawnInfo, params.BeadID, hookWorkDir, convoyFut.ID())
 				result.ErrMsg = fmt.Sprintf("formula failed: %v", err)
 				return result, fmt.Errorf("instantiating formula %s: %w", params.FormulaName, err)
 			}
@@ -320,6 +318,18 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 	// 7. Hook bead and store fields in a single bd update call
 	actor := detectActor()
 	hookDir := beads.ResolveHookDir(townRoot, beadToHook, hookWorkDir)
+
+	// Collect background convoy result before storing fields.
+	convoyID := ""
+	if convoyFut != nil {
+		if id, err := convoyFut.Wait(); err != nil {
+			fmt.Printf("  %s Could not create auto-convoy: %v\n", style.Dim.Render("Warning:"), err)
+		} else {
+			convoyID = id
+			fmt.Printf("  %s Created convoy %s\n", style.Bold.Render("→"), convoyID)
+		}
+	}
+
 	fieldUpdates := beadFieldUpdates{
 		Dispatcher:       actor,
 		Args:             params.Args,
