@@ -21,6 +21,7 @@ var (
 	feedMol      string
 	feedType     string
 	feedRig      string
+	feedConvoy   string
 	feedNoFollow bool
 	feedWindow   bool
 	feedPlain    bool
@@ -38,6 +39,7 @@ func init() {
 	feedCmd.Flags().StringVar(&feedMol, "mol", "", "Filter by molecule/issue ID prefix")
 	feedCmd.Flags().StringVar(&feedType, "type", "", "Filter by event type (create, update, delete, comment)")
 	feedCmd.Flags().StringVar(&feedRig, "rig", "", "Filter events by rig name")
+	feedCmd.Flags().StringVar(&feedConvoy, "convoy", "", "Filter events by convoy ID (shows events for beads tracked by the convoy)")
 	feedCmd.Flags().BoolVarP(&feedWindow, "window", "w", false, "Open in dedicated tmux window (creates 'feed' window)")
 	feedCmd.Flags().BoolVar(&feedPlain, "plain", false, "Use plain text output (bd activity) instead of TUI")
 	feedCmd.Flags().BoolVarP(&feedProblems, "problems", "p", false, "Start in problems view (shows stuck agents)")
@@ -112,7 +114,8 @@ Examples:
   gt feed --since 1h            # Events from last hour
   gt feed --summary             # Summary of last 24h
   gt feed --summary --since 1h  # Summary of last hour
-  gt feed --rig greenplace      # Use gastown rig's beads`,
+  gt feed --rig greenplace      # Use gastown rig's beads
+  gt feed --convoy hq-abc       # Events for beads in convoy hq-abc`,
 	RunE: runFeed,
 }
 
@@ -142,11 +145,12 @@ func runFeed(cmd *cobra.Command, args []string) error {
 			since = "24h" // default to 24h for summary
 		}
 		return feed.PrintSummary(townRoot, feed.PrintOptions{
-			Limit: feedLimit,
-			Since: since,
-			Mol:   feedMol,
-			Type:  feedType,
-			Rig:   feedRig,
+			Limit:  feedLimit,
+			Since:  since,
+			Mol:    feedMol,
+			Type:   feedType,
+			Rig:    feedRig,
+			Convoy: feedConvoy,
 		})
 	}
 
@@ -224,6 +228,10 @@ func buildFeedArgs() []string {
 		args = append(args, "--rig", feedRig)
 	}
 
+	if feedConvoy != "" {
+		args = append(args, "--convoy", feedConvoy)
+	}
+
 	return args
 }
 
@@ -248,6 +256,7 @@ func runFeedDirect(townRoot string) error {
 		Mol:    feedMol,
 		Type:   feedType,
 		Rig:    feedRig,
+		Convoy: feedConvoy,
 	}
 
 	return feed.PrintGtEvents(townRoot, opts)
