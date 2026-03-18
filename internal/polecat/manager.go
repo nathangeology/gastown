@@ -1934,15 +1934,111 @@ func (m *Manager) List() ([]*Polecat, error) {
 // Idle polecats have completed their work and have a preserved sandbox (worktree)
 // that can be reused by gt sling without creating a new worktree.
 // Persistent polecat model (gt-4ac).
+//
+// Optimized (gs-65e): pre-filters with tmux session set (one subprocess) and
+// uses a single batch Dolt query for all hooked beads, replacing the previous
+// N×(3-5) per-polecat Dolt queries with 1.
 func (m *Manager) FindIdlePolecat() (*Polecat, error) {
-	polecats, err := m.List()
+	// Step 1: List polecat directories (filesystem only, no Dolt).
+	polecatsDir := filepath.Join(m.rig.Path, "polecats")
+	entries, err := os.ReadDir(polecatsDir)
 	if err != nil {
-		return nil, err
-	}
-	for _, p := range polecats {
-		if p.State == StateIdle {
-			return p, nil
+		if os.IsNotExist(err) {
+			return nil, nil
 		}
+		return nil, fmt.Errorf("reading polecats dir: %w", err)
+	}
+
+	// Collect valid polecat directory names.
+	var names []string
+	for _, entry := range entries {
+		if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
+			names = append(names, entry.Name())
+		}
+	}
+	if len(names) == 0 {
+		return nil, nil
+	}
+
+	// Step 2: Batch tmux pre-filter — one subprocess for all sessions.
+	// Polecats with live, non-stale sessions are definitely not idle.
+	var sessionSet *tmux.SessionSet
+	if m.tmux != nil {
+		sessionSet, _ = m.tmux.GetSessionSet()
+	}
+	rigPrefix := session.PrefixFor(m.rig.Name)
+	townRoot := filepath.Dir(m.rig.Path)
+
+	var candidates []string
+	for _, name := range names {
+		sessionName := session.PolecatSessionName(rigPrefix, name)
+		if sessionSet.Has(sessionName) {
+			// Session exists — check if it's stale (process dead).
+			if !isSessionProcessDead(m.tmux, sessionName, townRoot) {
+				continue // Live session → not idle, skip.
+			}
+		}
+		candidates = append(candidates, name)
+	}
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	// Step 3: One batch Dolt query — get all hooked beads at once.
+	hookedBeads, err := m.beads.List(beads.ListOptions{
+		Status:   beads.StatusHooked,
+		Priority: -1,
+	})
+	hookedByAssignee := make(map[string]*beads.Issue, len(hookedBeads))
+	if err == nil {
+		for _, b := range hookedBeads {
+			if b.Assignee != "" {
+				hookedByAssignee[b.Assignee] = b
+			}
+		}
+	}
+
+	// Step 4: Check candidates against the map.
+	for _, name := range candidates {
+		assignee := m.assigneeID(name)
+		if _, hasWork := hookedByAssignee[assignee]; hasWork {
+			continue // Has hooked work → not idle.
+		}
+
+		// No live session, no hooked work. Do a lightweight agent bead check
+		// to confirm idle state (avoids the full loadFromBeads per-polecat path).
+		agentID := m.agentBeadID(name)
+		_, fields, agentErr := m.beads.GetAgentBead(agentID)
+
+		// If agent bead says idle, or there's no agent bead / no hook_bead, it's idle.
+		if agentErr == nil && fields != nil && fields.HookBead != "" {
+			// Legacy hook_bead set — verify it's still a current hooked bead for this assignee.
+			if hookIssue, showErr := m.beads.Show(fields.HookBead); showErr == nil &&
+				isCurrentHookedIssueForAssignee(hookIssue, assignee) {
+				continue // Still has active work via legacy hook_bead.
+			}
+		}
+
+		// Also check for non-hooked assigned work (open/in_progress).
+		issue, beadsErr := m.beads.GetAssignedIssue(assignee)
+		if beadsErr == nil && issue != nil {
+			continue // Has assigned work.
+		}
+
+		clonePath := m.clonePath(name)
+		polecatGit := git.NewGit(clonePath)
+		branchName, brErr := polecatGit.CurrentBranch()
+		if brErr != nil {
+			branchName = fmt.Sprintf("polecat/%s", name)
+		}
+
+		return &Polecat{
+			Name:      name,
+			Rig:       m.rig.Name,
+			State:     StateIdle,
+			ClonePath: clonePath,
+			Branch:    branchName,
+		}, nil
 	}
 	return nil, nil
 }

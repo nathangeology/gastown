@@ -379,7 +379,7 @@ func TestMatchesFilters(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := matchesFilters(event, tc.sinceTime, tc.mol, tc.eventType, tc.rig)
+			got := matchesFilters(event, tc.sinceTime, tc.mol, tc.eventType, tc.rig, nil)
 			if got != tc.want {
 				t.Errorf("matchesFilters() = %v, want %v", got, tc.want)
 			}

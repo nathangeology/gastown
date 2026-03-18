@@ -2,14 +2,19 @@ package feed
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/constants"
 )
 
 // PrintOptions controls filtering and behavior for PrintGtEvents.
@@ -20,6 +25,7 @@ type PrintOptions struct {
 	Mol    string // molecule/issue ID prefix filter
 	Type   string // event type filter
 	Rig    string // rig name filter (matches event's Rig field)
+	Convoy string // convoy ID filter (shows events for beads tracked by the convoy)
 	Ctx    context.Context // optional: controls follow-mode lifecycle; nil uses signal.NotifyContext
 }
 
@@ -44,6 +50,15 @@ func PrintGtEvents(townRoot string, opts PrintOptions) error {
 		sinceTime = time.Now().Add(-dur)
 	}
 
+	// Resolve convoy members if --convoy is set
+	var convoyMembers map[string]bool
+	if opts.Convoy != "" {
+		convoyMembers = resolveConvoyMembers(townRoot, opts.Convoy)
+		if len(convoyMembers) == 0 {
+			fmt.Fprintf(os.Stderr, "Warning: no tracked beads found for convoy %s\n", opts.Convoy)
+		}
+	}
+
 	var events []Event
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
@@ -51,7 +66,7 @@ func PrintGtEvents(townRoot string, opts PrintOptions) error {
 	for scanner.Scan() {
 		line := scanner.Text()
 		if event := parseGtEventLine(line); event != nil {
-			if matchesFilters(event, sinceTime, opts.Mol, opts.Type, opts.Rig) {
+			if matchesFilters(event, sinceTime, opts.Mol, opts.Type, opts.Rig, convoyMembers) {
 				events = append(events, *event)
 			}
 		}
@@ -113,7 +128,7 @@ func PrintGtEvents(townRoot string, opts PrintOptions) error {
 			for s.Scan() {
 				line := s.Text()
 				if event := parseGtEventLine(line); event != nil {
-					if matchesFilters(event, sinceTime, opts.Mol, opts.Type, opts.Rig) {
+					if matchesFilters(event, sinceTime, opts.Mol, opts.Type, opts.Rig, convoyMembers) {
 						printEvent(*event)
 					}
 				}
@@ -122,8 +137,8 @@ func PrintGtEvents(townRoot string, opts PrintOptions) error {
 	}
 }
 
-// matchesFilters checks whether an event passes the --since, --mol, --type, and --rig filters.
-func matchesFilters(event *Event, sinceTime time.Time, mol, eventType, rig string) bool {
+// matchesFilters checks whether an event passes the --since, --mol, --type, --rig, and --convoy filters.
+func matchesFilters(event *Event, sinceTime time.Time, mol, eventType, rig string, convoyMembers map[string]bool) bool {
 	if !sinceTime.IsZero() && event.Time.Before(sinceTime) {
 		return false
 	}
@@ -136,7 +151,61 @@ func matchesFilters(event *Event, sinceTime time.Time, mol, eventType, rig strin
 	if rig != "" && event.Rig != rig {
 		return false
 	}
+	if convoyMembers != nil && !convoyMemberMatch(event, convoyMembers) {
+		return false
+	}
 	return true
+}
+
+// convoyMemberMatch checks if an event's target bead is in the convoy member set.
+func convoyMemberMatch(event *Event, members map[string]bool) bool {
+	if event.Target != "" && members[event.Target] {
+		return true
+	}
+	// Also check if any convoy member ID appears in the message
+	for id := range members {
+		if strings.Contains(event.Message, id) {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveConvoyMembers queries bd for beads tracked by the given convoy ID.
+func resolveConvoyMembers(townRoot, convoyID string) map[string]bool {
+	ctx, cancel := context.WithTimeout(context.Background(), constants.BdSubprocessTimeout)
+	defer cancel()
+
+	beadsDir := filepath.Join(townRoot, ".beads")
+	cmd := exec.CommandContext(ctx, "bd", "dep", "list", convoyID, "-t", "tracks", "--json")
+	cmd.Dir = beadsDir
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	if err := cmd.Run(); err != nil {
+		return nil
+	}
+
+	var deps []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &deps); err != nil {
+		return nil
+	}
+
+	members := make(map[string]bool, len(deps))
+	for _, d := range deps {
+		id := d.ID
+		// Strip external:prefix:id wrapper if present
+		if strings.HasPrefix(id, "external:") {
+			parts := strings.SplitN(id, ":", 3)
+			if len(parts) == 3 {
+				id = parts[2]
+			}
+		}
+		members[id] = true
+	}
+	return members
 }
 
 // printEvent formats and prints a single event line.
@@ -171,13 +240,19 @@ func PrintSummary(townRoot string, opts PrintOptions) error {
 	}
 	sinceTime := time.Now().Add(-dur)
 
+	// Resolve convoy members if --convoy is set
+	var convoyMembers map[string]bool
+	if opts.Convoy != "" {
+		convoyMembers = resolveConvoyMembers(townRoot, opts.Convoy)
+	}
+
 	// Collect matching events
 	var events []Event
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 	for scanner.Scan() {
 		if event := parseGtEventLine(scanner.Text()); event != nil {
-			if matchesFilters(event, sinceTime, opts.Mol, opts.Type, opts.Rig) {
+			if matchesFilters(event, sinceTime, opts.Mol, opts.Type, opts.Rig, convoyMembers) {
 				events = append(events, *event)
 			}
 		}
