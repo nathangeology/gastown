@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -225,5 +227,315 @@ func TestManagerDoesNotTreatLiveSessionAsIdle(t *testing.T) {
 	}
 	if idle != nil {
 		t.Fatalf("FindIdlePolecat() = %q, want nil while session %s is alive", idle.Name, sessionName)
+	}
+}
+
+func TestAddWithOptions_NoPrimeMDCreatedLocally(t *testing.T) {
+	// This test verifies that ProvisionPrimeMDForWorktree does NOT create
+	// a local .beads/PRIME.md in the worktree when there's no tracked one.
+	//
+	// Bug: If redirect setup fails or ProvisionPrimeMDForWorktree doesn't
+	// follow redirects correctly, it may create PRIME.md locally instead
+	// of at the rig-level beads location.
+
+	root := t.TempDir()
+
+	// Create mayor/rig directory structure
+	mayorRig := filepath.Join(root, "mayor", "rig")
+	if err := os.MkdirAll(mayorRig, 0755); err != nil {
+		t.Fatalf("mkdir mayor/rig: %v", err)
+	}
+
+	// Create rig-level .beads directory
+	rigBeads := filepath.Join(root, ".beads")
+	if err := os.MkdirAll(rigBeads, 0755); err != nil {
+		t.Fatalf("mkdir rig .beads: %v", err)
+	}
+
+	// Create redirect at rig level pointing to mayor/rig/.beads
+	mayorBeads := filepath.Join(mayorRig, ".beads")
+	if err := os.MkdirAll(mayorBeads, 0755); err != nil {
+		t.Fatalf("mkdir mayor/rig/.beads: %v", err)
+	}
+	rigRedirect := filepath.Join(rigBeads, "redirect")
+	if err := os.WriteFile(rigRedirect, []byte("mayor/rig/.beads\n"), 0644); err != nil {
+		t.Fatalf("write rig redirect: %v", err)
+	}
+
+	// Initialize beads database so agent bead creation works.
+	testutil.RequireDoltContainer(t)
+	port, _ := strconv.Atoi(testutil.DoltContainerPort())
+	bd := beads.NewIsolatedWithPort(mayorRig, port)
+	if err := bd.Init("gt"); err != nil {
+		t.Fatalf("bd init: %v", err)
+	}
+
+	// Initialize git repo in mayor/rig WITHOUT any .beads/PRIME.md
+	cmd := exec.Command("git", "init")
+	cmd.Dir = mayorRig
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+
+	// Create a dummy file and commit (NO .beads/PRIME.md)
+	dummyPath := filepath.Join(mayorRig, "README.md")
+	if err := os.WriteFile(dummyPath, []byte("# Test\n"), 0644); err != nil {
+		t.Fatalf("write README.md: %v", err)
+	}
+	mayorGit := git.NewGit(mayorRig)
+	if err := mayorGit.Add("README.md"); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
+	if err := mayorGit.Commit("Initial commit without PRIME.md"); err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
+
+	// AddWithOptions needs origin/main to exist. Add self as origin and create tracking ref.
+	cmd = exec.Command("git", "remote", "add", "origin", mayorRig)
+	cmd.Dir = mayorRig
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git remote add: %v\n%s", err, out)
+	}
+	cmd = exec.Command("git", "update-ref", "refs/remotes/origin/main", "HEAD")
+	cmd.Dir = mayorRig
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git update-ref: %v\n%s", err, out)
+	}
+
+	// Create rig pointing to root
+	r := &rig.Rig{
+		Name: "rig",
+		Path: root,
+	}
+	m := NewManager(r, git.NewGit(root), nil)
+
+	// Create polecat
+	polecat, err := m.AddWithOptions("TestNoLocal", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+
+	// BUG CHECK: The worktree should NOT have a local .beads/PRIME.md
+	worktreePrimeMD := filepath.Join(polecat.ClonePath, ".beads", "PRIME.md")
+	if _, err := os.Stat(worktreePrimeMD); err == nil {
+		t.Errorf("PRIME.md should NOT exist in worktree .beads/ (should be at rig level via redirect): %s", worktreePrimeMD)
+	}
+
+	// Verify the redirect file exists
+	worktreeRedirect := filepath.Join(polecat.ClonePath, ".beads", "redirect")
+	if _, err := os.Stat(worktreeRedirect); os.IsNotExist(err) {
+		t.Errorf("redirect file should exist at: %s", worktreeRedirect)
+	}
+
+	// Verify PRIME.md was created at mayor/rig/.beads/ (where redirect points)
+	mayorPrimeMD := filepath.Join(mayorBeads, "PRIME.md")
+	if _, err := os.Stat(mayorPrimeMD); os.IsNotExist(err) {
+		t.Errorf("PRIME.md should exist at mayor/rig/.beads/: %s", mayorPrimeMD)
+	}
+}
+
+func TestAddWithOptions_NoFilesAddedToRepo(t *testing.T) {
+	// This test verifies the invariant that polecat creation does NOT add any
+	// TRACKED files to the repo's directory structure.
+
+	root := t.TempDir()
+
+	// Create mayor/rig directory structure
+	mayorRig := filepath.Join(root, "mayor", "rig")
+	if err := os.MkdirAll(mayorRig, 0755); err != nil {
+		t.Fatalf("mkdir mayor/rig: %v", err)
+	}
+
+	// Create rig-level .beads directory with redirect
+	rigBeads := filepath.Join(root, ".beads")
+	if err := os.MkdirAll(rigBeads, 0755); err != nil {
+		t.Fatalf("mkdir rig .beads: %v", err)
+	}
+	mayorBeads := filepath.Join(mayorRig, ".beads")
+	if err := os.MkdirAll(mayorBeads, 0755); err != nil {
+		t.Fatalf("mkdir mayor/rig/.beads: %v", err)
+	}
+	rigRedirect := filepath.Join(rigBeads, "redirect")
+	if err := os.WriteFile(rigRedirect, []byte("mayor/rig/.beads\n"), 0644); err != nil {
+		t.Fatalf("write rig redirect: %v", err)
+	}
+
+	// Initialize beads database so agent bead creation works.
+	testutil.RequireDoltContainer(t)
+	port, _ := strconv.Atoi(testutil.DoltContainerPort())
+	bd := beads.NewIsolatedWithPort(mayorRig, port)
+	if err := bd.Init("gt"); err != nil {
+		t.Fatalf("bd init: %v", err)
+	}
+
+	// Initialize a CLEAN git repo with known files only
+	cmd := exec.Command("git", "init")
+	cmd.Dir = mayorRig
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+
+	gitignorePath := filepath.Join(mayorRig, ".gitignore")
+	if err := os.WriteFile(gitignorePath, []byte(".claude/\n.beads/\n"), 0644); err != nil {
+		t.Fatalf("write .gitignore: %v", err)
+	}
+
+	readmePath := filepath.Join(mayorRig, "README.md")
+	if err := os.WriteFile(readmePath, []byte("# Clean Repo\n"), 0644); err != nil {
+		t.Fatalf("write README.md: %v", err)
+	}
+	srcDir := filepath.Join(mayorRig, "src")
+	if err := os.MkdirAll(srcDir, 0755); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	mainPath := filepath.Join(srcDir, "main.go")
+	if err := os.WriteFile(mainPath, []byte("package main\n"), 0644); err != nil {
+		t.Fatalf("write main.go: %v", err)
+	}
+
+	mayorGit := git.NewGit(mayorRig)
+	if err := mayorGit.Add("."); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
+	if err := mayorGit.Commit("Initial commit - clean repo"); err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
+
+	cmd = exec.Command("git", "remote", "add", "origin", mayorRig)
+	cmd.Dir = mayorRig
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git remote add: %v\n%s", err, out)
+	}
+	cmd = exec.Command("git", "update-ref", "refs/remotes/origin/main", "HEAD")
+	cmd.Dir = mayorRig
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git update-ref: %v\n%s", err, out)
+	}
+
+	agentsMDPath := filepath.Join(mayorRig, "AGENTS.md")
+	if err := os.WriteFile(agentsMDPath, []byte("# AGENTS\n\nFallback content.\n"), 0644); err != nil {
+		t.Fatalf("write AGENTS.md: %v", err)
+	}
+
+	r := &rig.Rig{
+		Name: "rig",
+		Path: root,
+	}
+	m := NewManager(r, git.NewGit(root), nil)
+
+	polecat, err := m.AddWithOptions("TestClean", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+
+	cmd = exec.Command("git", "status", "--porcelain")
+	cmd.Dir = polecat.ClonePath
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git status: %v\n%s", err, out)
+	}
+
+	var unexpected []string
+	for _, line := range strings.Split(string(out), "\n") {
+		if line == "" {
+			continue
+		}
+		if strings.Contains(line, ".beads") {
+			continue
+		}
+		unexpected = append(unexpected, line)
+	}
+	if len(unexpected) > 0 {
+		t.Errorf("polecat worktree should be clean after install (no files added to repo), but git status shows:\n%s", strings.Join(unexpected, "\n"))
+	}
+}
+
+func TestAddWithOptions_SettingsInstalledInPolecatsDir(t *testing.T) {
+	// This test verifies that polecat creation installs .claude/settings.json
+	// in the SHARED polecats/ parent directory (not inside individual worktrees).
+
+	root := t.TempDir()
+
+	// Create mayor/rig directory structure
+	mayorRig := filepath.Join(root, "mayor", "rig")
+	if err := os.MkdirAll(mayorRig, 0755); err != nil {
+		t.Fatalf("mkdir mayor/rig: %v", err)
+	}
+
+	// Create rig-level .beads directory with redirect
+	rigBeads := filepath.Join(root, ".beads")
+	if err := os.MkdirAll(rigBeads, 0755); err != nil {
+		t.Fatalf("mkdir rig .beads: %v", err)
+	}
+	mayorBeads := filepath.Join(mayorRig, ".beads")
+	if err := os.MkdirAll(mayorBeads, 0755); err != nil {
+		t.Fatalf("mkdir mayor/rig/.beads: %v", err)
+	}
+	rigRedirect := filepath.Join(rigBeads, "redirect")
+	if err := os.WriteFile(rigRedirect, []byte("mayor/rig/.beads\n"), 0644); err != nil {
+		t.Fatalf("write rig redirect: %v", err)
+	}
+
+	// Initialize beads database so agent bead creation works.
+	testutil.RequireDoltContainer(t)
+	port, _ := strconv.Atoi(testutil.DoltContainerPort())
+	bd := beads.NewIsolatedWithPort(mayorRig, port)
+	if err := bd.Init("gt"); err != nil {
+		t.Fatalf("bd init: %v", err)
+	}
+
+	// Initialize a git repo
+	cmd := exec.Command("git", "init")
+	cmd.Dir = mayorRig
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+
+	readmePath := filepath.Join(mayorRig, "README.md")
+	if err := os.WriteFile(readmePath, []byte("# Test Repo\n"), 0644); err != nil {
+		t.Fatalf("write README.md: %v", err)
+	}
+
+	mayorGit := git.NewGit(mayorRig)
+	if err := mayorGit.Add("."); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
+	if err := mayorGit.Commit("Initial commit"); err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
+
+	cmd = exec.Command("git", "remote", "add", "origin", mayorRig)
+	cmd.Dir = mayorRig
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git remote add: %v\n%s", err, out)
+	}
+	cmd = exec.Command("git", "update-ref", "refs/remotes/origin/main", "HEAD")
+	cmd.Dir = mayorRig
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git update-ref: %v\n%s", err, out)
+	}
+
+	r := &rig.Rig{
+		Name: "rig",
+		Path: root,
+	}
+	m := NewManager(r, git.NewGit(root), nil)
+
+	polecat, err := m.AddWithOptions("TestSettings", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+
+	// Verify settings.json exists in the SHARED polecats/ parent directory
+	polecatsDir := filepath.Dir(filepath.Dir(polecat.ClonePath))
+	settingsPath := filepath.Join(polecatsDir, ".claude", "settings.json")
+	if _, err := os.Stat(settingsPath); os.IsNotExist(err) {
+		t.Errorf("settings.json should exist at %s (shared polecats dir) for Claude Code to find hooks", settingsPath)
+	}
+
+	// Verify settings.json does NOT exist inside the worktree
+	worktreeSettingsPath := filepath.Join(polecat.ClonePath, ".claude", "settings.json")
+	if _, err := os.Stat(worktreeSettingsPath); err == nil {
+		t.Errorf("settings.json should NOT exist inside worktree at %s (settings are now in shared polecats dir)", worktreeSettingsPath)
 	}
 }
