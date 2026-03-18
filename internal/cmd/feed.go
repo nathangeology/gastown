@@ -25,6 +25,7 @@ var (
 	feedWindow   bool
 	feedPlain    bool
 	feedProblems bool
+	feedSummary  bool
 )
 
 func init() {
@@ -40,6 +41,7 @@ func init() {
 	feedCmd.Flags().BoolVarP(&feedWindow, "window", "w", false, "Open in dedicated tmux window (creates 'feed' window)")
 	feedCmd.Flags().BoolVar(&feedPlain, "plain", false, "Use plain text output (bd activity) instead of TUI")
 	feedCmd.Flags().BoolVarP(&feedProblems, "problems", "p", false, "Start in problems view (shows stuck agents)")
+	feedCmd.Flags().BoolVar(&feedSummary, "summary", false, "Show aggregated summary of events (use with --since)")
 }
 
 var feedCmd = &cobra.Command{
@@ -67,6 +69,11 @@ The feed combines multiple event sources:
   - Convoy status: In-progress and recently-landed convoys (refreshes every 10s)
 
 Use --plain for simple text output (reads .events.jsonl directly).
+
+Summary Mode (--summary):
+  Aggregates events by type and actor over a time window.
+  Defaults to --since 24h if no --since is specified.
+  Output: "12 beads closed, 3 merges, 2 escalations" style summary.
 
 Tmux Integration:
   Use --window to open the feed in a dedicated tmux window named 'feed'.
@@ -103,6 +110,8 @@ Examples:
   gt feed --plain               # Plain text output (bd activity)
   gt feed --window              # Open in dedicated tmux window
   gt feed --since 1h            # Events from last hour
+  gt feed --summary             # Summary of last 24h
+  gt feed --summary --since 1h  # Summary of last hour
   gt feed --rig greenplace      # Use gastown rig's beads`,
 	RunE: runFeed,
 }
@@ -124,6 +133,21 @@ func runFeed(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("getting current directory: %w", err)
 		}
 		return runFeedInWindow(workDir, bdArgs)
+	}
+
+	// Handle --summary mode: aggregate events and print summary
+	if feedSummary {
+		since := feedSince
+		if since == "" {
+			since = "24h" // default to 24h for summary
+		}
+		return feed.PrintSummary(townRoot, feed.PrintOptions{
+			Limit: feedLimit,
+			Since: since,
+			Mol:   feedMol,
+			Type:  feedType,
+			Rig:   feedRig,
+		})
 	}
 
 	// Use TUI by default if running in a terminal and not --plain

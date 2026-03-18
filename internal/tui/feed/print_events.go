@@ -150,6 +150,119 @@ func printEvent(event Event) {
 	fmt.Printf("[%s] %s %-25s %s\n", ts, symbol, actor, event.Message)
 }
 
+// PrintSummary reads .events.jsonl and prints an aggregated summary.
+// Groups events by type and actor over the time window specified by opts.Since.
+func PrintSummary(townRoot string, opts PrintOptions) error {
+	eventsPath := filepath.Join(townRoot, ".events.jsonl")
+	file, err := os.Open(eventsPath)
+	if err != nil {
+		return fmt.Errorf("no events file found at %s: %w", eventsPath, err)
+	}
+	defer file.Close()
+
+	// Parse --since into a cutoff time (required for summary)
+	since := opts.Since
+	if since == "" {
+		since = "24h"
+	}
+	dur, err := time.ParseDuration(since)
+	if err != nil {
+		return fmt.Errorf("invalid --since duration %q: %w", since, err)
+	}
+	sinceTime := time.Now().Add(-dur)
+
+	// Collect matching events
+	var events []Event
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	for scanner.Scan() {
+		if event := parseGtEventLine(scanner.Text()); event != nil {
+			if matchesFilters(event, sinceTime, opts.Mol, opts.Type, opts.Rig) {
+				events = append(events, *event)
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("reading events: %w", err)
+	}
+
+	if len(events) == 0 {
+		fmt.Printf("No events in the last %s\n", since)
+		return nil
+	}
+
+	// Aggregate by type
+	typeCounts := map[string]int{}
+	actorCounts := map[string]int{}
+	for _, e := range events {
+		typeCounts[e.Type]++
+		if e.Actor != "" {
+			actorCounts[e.Actor]++
+		}
+	}
+
+	// Print header
+	fmt.Printf("Summary (%s, %d events):\n", since, len(events))
+
+	// Print type breakdown in a readable order
+	typeOrder := []struct{ key, label string }{
+		{"done", "completed"},
+		{"complete", "beads closed"},
+		{"merged", "merges"},
+		{"merge_failed", "merge failures"},
+		{"sling", "slings"},
+		{"escalation_sent", "escalations"},
+		{"handoff", "handoffs"},
+		{"create", "created"},
+		{"patrol_started", "patrols"},
+		{"polecat_nudged", "nudges"},
+		{"mail", "mails"},
+	}
+
+	var parts []string
+	seen := map[string]bool{}
+	for _, t := range typeOrder {
+		if c, ok := typeCounts[t.key]; ok {
+			parts = append(parts, fmt.Sprintf("%d %s", c, t.label))
+			seen[t.key] = true
+		}
+	}
+	// Append any unseen types
+	for k, c := range typeCounts {
+		if !seen[k] {
+			parts = append(parts, fmt.Sprintf("%d %s", c, k))
+		}
+	}
+	fmt.Printf("  %s\n", strings.Join(parts, ", "))
+
+	// Print top actors
+	if len(actorCounts) > 0 {
+		type actorCount struct {
+			actor string
+			count int
+		}
+		var actors []actorCount
+		for a, c := range actorCounts {
+			actors = append(actors, actorCount{a, c})
+		}
+		sort.Slice(actors, func(i, j int) bool { return actors[i].count > actors[j].count })
+
+		fmt.Printf("Top actors:\n")
+		limit := 5
+		if len(actors) < limit {
+			limit = len(actors)
+		}
+		for _, a := range actors[:limit] {
+			fmt.Printf("  %-30s %d events\n", a.actor, a.count)
+		}
+		if len(actors) > 5 {
+			fmt.Printf("  ... and %d more\n", len(actors)-5)
+		}
+	}
+
+	return nil
+}
+
 func typeSymbol(eventType string) string {
 	switch eventType {
 	case "patrol_started":
