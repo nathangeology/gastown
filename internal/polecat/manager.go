@@ -1931,7 +1931,20 @@ func (m *Manager) List() ([]*Polecat, error) {
 // Optimized (gs-65e): pre-filters with tmux session set (one subprocess) and
 // uses a single batch Dolt query for all hooked beads, replacing the previous
 // N×(3-5) per-polecat Dolt queries with 1.
+//
+// Fast path (gs-jig): checks polecats/.idle-pool file first. This file is
+// maintained by gt done (writes) and PopIdlePool (consumes), giving a
+// zero-Dolt-query path for the common case. Falls back to the batch query
+// when the file is empty or stale.
 func (m *Manager) FindIdlePolecat() (*Polecat, error) {
+	// Fast path: pop from idle-pool file cache
+	if name := m.PopIdlePool(); name != "" {
+		if p, err := m.Get(name); err == nil && p.State == StateIdle {
+			return p, nil
+		}
+		// Stale entry — fall through to batch query
+	}
+
 	// Step 1: List polecat directories (filesystem only, no Dolt).
 	polecatsDir := filepath.Join(m.rig.Path, "polecats")
 	entries, err := os.ReadDir(polecatsDir)

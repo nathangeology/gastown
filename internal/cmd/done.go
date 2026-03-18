@@ -1044,6 +1044,16 @@ notifyWitness:
 		}
 
 		fmt.Printf("%s Polecat transitioned to IDLE — ready for new work\n", style.Bold.Render("✓"))
+
+		// Write polecat name to idle-pool file cache (gs-jig).
+		// This gives FindIdlePolecat a zero-Dolt-query fast path on next sling.
+		if polecatName != "" && rigName != "" {
+			if mgr, _, mgrErr := getPolecatManager(rigName); mgrErr == nil {
+				if err := mgr.WriteIdlePool(polecatName); err != nil {
+					style.PrintWarning("could not write to idle-pool: %v", err)
+				}
+			}
+		}
 	}
 
 	fmt.Println()
