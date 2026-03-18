@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
@@ -395,28 +394,11 @@ func (s *SpawnedPolecatInfo) StartSession() (string, error) {
 		return "", fmt.Errorf("starting session: %w", err)
 	}
 
-	// Wait for runtime to be fully ready before returning.
-	// When an agent override is specified (e.g., --agent codex), resolve the runtime
-	// config from the override so WaitForRuntimeReady uses the correct readiness
-	// strategy (delay-based for Codex vs prompt-polling for Claude). Without this,
-	// ResolveRoleAgentConfig returns the default agent (Claude) and polls for "❯ "
-	// in a Codex session, always timing out after 30 seconds (gt-1j3m).
-	spawnTownRoot := filepath.Dir(r.Path)
-	var runtimeConfig *config.RuntimeConfig
-	if s.agent != "" {
-		rc, _, err := config.ResolveAgentConfigWithOverride(spawnTownRoot, r.Path, s.agent)
-		if err != nil {
-			style.PrintWarning("resolving agent config for %s: %v (using default)", s.agent, err)
-			runtimeConfig = config.ResolveRoleAgentConfig("polecat", spawnTownRoot, r.Path)
-		} else {
-			runtimeConfig = rc
-		}
-	} else {
-		runtimeConfig = config.ResolveRoleAgentConfig("polecat", spawnTownRoot, r.Path)
-	}
-	if err := t.WaitForRuntimeReady(s.SessionName, runtimeConfig, 30*time.Second); err != nil {
-		style.PrintWarning("runtime may not be fully ready: %v", err)
-	}
+	// Hybrid fast-sling (gs-9hc): skip synchronous WaitForRuntimeReady.
+	// The SessionStart hook runs gt prime --hook automatically, so the agent
+	// discovers work via its hook. WaitForRuntimeReady added 5-25s of prompt
+	// polling that degrades gracefully on timeout anyway. The async verification
+	// goroutine (asyncVerifyAgentWorking) in the caller provides a safety net.
 
 	// Update agent state with retry logic (gt-94llt7: fail-safe Dolt writes).
 	// Note: warn-only, not fail-hard. The tmux session is already started above,

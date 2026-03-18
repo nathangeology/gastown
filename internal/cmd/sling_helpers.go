@@ -486,8 +486,9 @@ func getSessionFromPane(pane string) string {
 }
 
 // ensureAgentReady waits for an agent to be ready before nudging an existing session.
-// Uses a pragmatic approach: wait for the pane to leave a shell, then (Claude-only)
-// accept the bypass permissions warning and give it a moment to finish initializing.
+// Uses a hybrid approach: short wait for agent process to start (~2-3s via WaitForCommand),
+// then accept startup dialogs. Skips the slow WaitForRuntimeReady prompt polling (5-25s).
+// Background verification (asyncVerifyAgentWorking) provides a safety net.
 func ensureAgentReady(sessionName string) error {
 	t := tmux.NewTmux()
 
@@ -512,39 +513,58 @@ func ensureAgentReady(sessionName string) error {
 		_ = t.AcceptBypassPermissionsWarning(sessionName)
 	}
 
-	// Use prompt-detection polling instead of fixed sleep.
-	// For known presets: uses ReadyPromptPrefix (e.g. "❯ " for Claude) polled every 200ms.
-	// For unknown/custom agents: falls back to a 1s fixed delay (mirrors old behavior).
-	// Note: uses preset-only resolution (not ResolveRoleAgentConfig) because
-	// ensureAgentReady lacks rig/town context — only has the session name.
-	effectiveName := agentName
-	if effectiveName == "" {
-		effectiveName = "claude" // Default sessions without GT_AGENT are Claude
-	}
-	var rc *config.RuntimeConfig
-	if preset := config.GetAgentPreset(config.AgentPreset(effectiveName)); preset != nil {
-		rc = config.RuntimeConfigFromPreset(config.AgentPreset(effectiveName))
-	} else {
-		// Unknown agent — use minimal config: no prompt detection, short fixed delay.
-		rc = &config.RuntimeConfig{
-			Tmux: &config.RuntimeTmuxConfig{
-				ReadyDelayMs: 1000,
-			},
-		}
-	}
-	// Ensure a minimum 1s readiness delay for presets without prompt detection.
-	// Without this, agents with ReadyPromptPrefix="" and ReadyDelayMs=0
-	// (e.g. gemini, cursor) would skip the readiness guard entirely,
-	// reintroducing early-input races that this function exists to prevent.
-	if rc.Tmux != nil && rc.Tmux.ReadyPromptPrefix == "" && rc.Tmux.ReadyDelayMs < 1000 {
-		rc.Tmux.ReadyDelayMs = 1000
-	}
-	if err := t.WaitForRuntimeReady(sessionName, rc, constants.ClaudeStartTimeout); err != nil {
-		// Graceful degradation: warn but proceed (matches original behavior of always continuing)
-		fmt.Fprintf(os.Stderr, "Warning: agent readiness detection timed out for %s: %v\n", sessionName, err)
-	}
+	// Skip WaitForRuntimeReady entirely (gs-9hc: hybrid fast-sling).
+	// The SessionStart hook runs gt prime --hook automatically, so the agent
+	// discovers work via its hook, not via the nudge. WaitForRuntimeReady
+	// added 5-25s of prompt polling that degrades gracefully on timeout anyway.
+	// Background verification (asyncVerifyAgentWorking) provides a safety net.
 
 	return nil
+}
+
+// asyncVerifyAgentWorking spawns a background goroutine that checks after delay
+// whether the polecat's agent_state is 'working'. If not, sends a nudge to
+// remind the agent to check its hook. This replaces the synchronous
+// WaitForRuntimeReady polling with an async safety net.
+func asyncVerifyAgentWorking(targetAgent, sessionName, beadID string, delay time.Duration) {
+	go func() {
+		time.Sleep(delay)
+
+		// Check if the agent bead shows 'working' state
+		townRoot, err := workspace.FindFromCwd()
+		if err != nil {
+			return
+		}
+		agentBeadID := agentIDToBeadID(targetAgent, townRoot)
+		if agentBeadID == "" {
+			return
+		}
+
+		out, err := BdCmd("show", agentBeadID, "--json", "--allow-stale").
+			Dir(townRoot).
+			StripBeadsDir().
+			Output()
+		if err != nil {
+			return
+		}
+
+		var issues []struct {
+			AgentState string `json:"agent_state"`
+		}
+		if err := json.Unmarshal(out, &issues); err != nil || len(issues) == 0 {
+			return
+		}
+
+		state := issues[0].AgentState
+		if state == "working" || state == "done" || state == "idle" {
+			return // Agent is active, no nudge needed
+		}
+
+		// Agent hasn't transitioned to working — send a nudge
+		t := tmux.NewTmux()
+		_ = t.NudgeSession(sessionName, fmt.Sprintf(
+			"Verification: bead %s is on your hook. Run `gt hook` and begin work immediately.", beadID))
+	}()
 }
 
 // isSessionYoung returns true if the tmux session was created less than maxAge ago.

@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
@@ -133,6 +134,7 @@ var (
 	slingRalph         bool   // --ralph: enable Ralph Wiggum loop mode for multi-step workflows
 	slingFormula       string // --formula: override formula for dispatch (default: mol-polecat-work)
 	slingCrew          string // --crew: target a crew member in the specified rig
+	slingNoWait        bool   // --no-wait: skip agent readiness wait entirely (fire-and-forget)
 )
 
 func init() {
@@ -160,6 +162,7 @@ func init() {
 	slingCmd.Flags().BoolVar(&slingRalph, "ralph", false, "Enable Ralph Wiggum loop mode (fresh context per step, for multi-step workflows)")
 	slingCmd.Flags().StringVar(&slingFormula, "formula", "", "Formula to apply (default: mol-polecat-work for polecat targets)")
 	slingCmd.Flags().StringVar(&slingCrew, "crew", "", "Target a crew member in the specified rig (e.g., --crew mel with target gastown → gastown/crew/mel)")
+	slingCmd.Flags().BoolVar(&slingNoWait, "no-wait", false, "Skip agent readiness wait (fire-and-forget sling)")
 
 	slingCmd.AddCommand(slingRespawnResetCmd)
 	rootCmd.AddCommand(slingCmd)
@@ -992,16 +995,23 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	prof.Begin("nudge")
 	if freshlySpawned {
 		// Fresh polecat already got StartupNudge from SessionManager.Start()
+		// Spawn async verification to nudge if agent doesn't start working (gs-9hc)
+		sessionName := getSessionFromPane(targetPane)
+		if sessionName != "" && !slingNoWait {
+			asyncVerifyAgentWorking(targetAgent, sessionName, beadID, 10*time.Second)
+		}
 	} else if isSelfSling {
 		// Self-sling: agent already knows about the work (just slung it)
 		fmt.Printf("%s Self-sling: work hooked, will process on next turn\n", style.Dim.Render("○"))
 	} else if targetPane == "" {
 		fmt.Printf("%s No pane to nudge (agent will discover work via gt prime)\n", style.Dim.Render("○"))
 	} else {
-		// Ensure agent is ready before nudging (prevents race condition where
-		// message arrives before Claude has fully started - see issue #115)
 		sessionName := getSessionFromPane(targetPane)
-		if sessionName != "" {
+		if slingNoWait {
+			// --no-wait: skip readiness check entirely, fire-and-forget
+			fmt.Printf("%s Skipping agent readiness wait (--no-wait)\n", style.Dim.Render("○"))
+		} else if sessionName != "" {
+			// Hybrid fast-sling (gs-9hc): short WaitForCommand + skip WaitForRuntimeReady
 			if err := ensureAgentReady(sessionName); err != nil {
 				// Non-fatal: warn and continue, agent will discover work via gt prime
 				fmt.Printf("%s Could not verify agent ready: %v\n", style.Dim.Render("○"), err)
@@ -1014,6 +1024,11 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 			fmt.Printf("  Agent will discover work via gt prime / bd show\n")
 		} else {
 			fmt.Printf("%s Start prompt sent\n", style.Bold.Render("▶"))
+		}
+
+		// Spawn async verification for existing sessions too (gs-9hc)
+		if sessionName != "" && !slingNoWait {
+			asyncVerifyAgentWorking(targetAgent, sessionName, beadID, 10*time.Second)
 		}
 	}
 
