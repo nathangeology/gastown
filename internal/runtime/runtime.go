@@ -236,7 +236,11 @@ func DeliverStartupPromptFallback(
 
 // StartupNudgeContent returns the work instructions to send as a startup nudge.
 func StartupNudgeContent() string {
-	return "Check your hook with `" + cli.Name() + " hook`. If work is present, begin immediately."
+	name := cli.Name()
+	return "Run these commands now:\n" +
+		"1. `" + name + " hook` — check your assigned work\n" +
+		"2. `" + name + " mail inbox` — check for messages\n" +
+		"If work is present, begin immediately."
 }
 
 // BeaconPrimeInstruction returns the instruction to add to beacon for non-hook agents.
