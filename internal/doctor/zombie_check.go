@@ -133,7 +133,7 @@ func (c *ZombieSessionCheck) Fix(ctx *CheckContext) error {
 
 		// Log pre-death event for audit trail
 		_ = events.LogFeed(events.TypeSessionDeath, sess,
-			events.SessionDeathPayload(sess, "unknown", "zombie cleanup", "gt doctor"))
+			events.SessionDeathPayload(sess, "unknown", "zombie cleanup", "gt doctor", ""))
 
 		// Use KillSessionWithProcesses to ensure all descendant processes are killed.
 		if err := t.KillSessionWithProcesses(sess); err != nil {

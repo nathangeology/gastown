@@ -196,7 +196,7 @@ func TestHaltPayload(t *testing.T) {
 }
 
 func TestSessionDeathPayload(t *testing.T) {
-	p := SessionDeathPayload("gt-gastown-alpha", "gastown/polecats/alpha", "zombie cleanup", "daemon")
+	p := SessionDeathPayload("gt-gastown-alpha", "gastown/polecats/alpha", "zombie cleanup", "daemon", "gs-abc")
 	if p["session"] != "gt-gastown-alpha" {
 		t.Errorf("session = %v, want gt-gastown-alpha", p["session"])
 	}
@@ -208,6 +208,16 @@ func TestSessionDeathPayload(t *testing.T) {
 	}
 	if p["caller"] != "daemon" {
 		t.Errorf("caller = %v", p["caller"])
+	}
+	if p["hook_bead"] != "gs-abc" {
+		t.Errorf("hook_bead = %v, want gs-abc", p["hook_bead"])
+	}
+}
+
+func TestSessionDeathPayload_NoHookBead(t *testing.T) {
+	p := SessionDeathPayload("gt-gastown-alpha", "gastown/polecats/alpha", "orphan cleanup", "gt doctor", "")
+	if _, ok := p["hook_bead"]; ok {
+		t.Error("expected no hook_bead key when empty")
 	}
 }
 
@@ -233,7 +243,7 @@ func TestMassDeathPayload_NoCause(t *testing.T) {
 }
 
 func TestSessionPayload_Full(t *testing.T) {
-	p := SessionPayload("uuid-123", "gastown/crew/tester", "fixing bugs", "/some/dir")
+	p := SessionPayload("uuid-123", "gastown/crew/tester", "fixing bugs", "/some/dir", "gs-xyz")
 	if p["session_id"] != "uuid-123" {
 		t.Errorf("session_id = %v", p["session_id"])
 	}
@@ -246,14 +256,20 @@ func TestSessionPayload_Full(t *testing.T) {
 	if p["cwd"] != "/some/dir" {
 		t.Errorf("cwd = %v", p["cwd"])
 	}
+	if p["hook_bead"] != "gs-xyz" {
+		t.Errorf("hook_bead = %v, want gs-xyz", p["hook_bead"])
+	}
 }
 
 func TestSessionPayload_Minimal(t *testing.T) {
-	p := SessionPayload("uuid-456", "deacon", "", "")
+	p := SessionPayload("uuid-456", "deacon", "", "", "")
 	if _, ok := p["topic"]; ok {
 		t.Error("expected no topic key when empty")
 	}
 	if _, ok := p["cwd"]; ok {
 		t.Error("expected no cwd key when empty")
+	}
+	if _, ok := p["hook_bead"]; ok {
+		t.Error("expected no hook_bead key when empty")
 	}
 }

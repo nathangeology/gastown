@@ -297,13 +297,18 @@ func HaltPayload(services []string) map[string]interface{} {
 // agent: Gas Town agent identity (e.g., "gastown/polecats/Toast")
 // reason: why the session was killed (e.g., "zombie cleanup", "user request", "doctor fix")
 // caller: what initiated the kill (e.g., "daemon", "doctor", "gt down")
-func SessionDeathPayload(session, agent, reason, caller string) map[string]interface{} {
-	return map[string]interface{}{
+// hookBead: bead ID the agent was working on (empty if unknown)
+func SessionDeathPayload(session, agent, reason, caller, hookBead string) map[string]interface{} {
+	p := map[string]interface{}{
 		"session": session,
 		"agent":   agent,
 		"reason":  reason,
 		"caller":  caller,
 	}
+	if hookBead != "" {
+		p["hook_bead"] = hookBead
+	}
+	return p
 }
 
 // MassDeathPayload creates a payload for mass death events.
@@ -328,7 +333,8 @@ func MassDeathPayload(count int, window string, sessions []string, possibleCause
 // role: Gas Town role (e.g., "gastown/crew/joe", "deacon")
 // topic: What the session is working on
 // cwd: Working directory
-func SessionPayload(sessionID, role, topic, cwd string) map[string]interface{} {
+// hookBead: bead ID the agent is working on (empty if unknown)
+func SessionPayload(sessionID, role, topic, cwd, hookBead string) map[string]interface{} {
 	p := map[string]interface{}{
 		"session_id": sessionID,
 		"role":       role,
@@ -339,6 +345,9 @@ func SessionPayload(sessionID, role, topic, cwd string) map[string]interface{} {
 	}
 	if cwd != "" {
 		p["cwd"] = cwd
+	}
+	if hookBead != "" {
+		p["hook_bead"] = hookBead
 	}
 	return p
 }

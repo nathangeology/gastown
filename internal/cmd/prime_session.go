@@ -232,9 +232,28 @@ func emitSessionEvent(ctx RoleContext) {
 		topic = "patrol"
 	}
 
+	// Look up hook_bead from agent bead (best-effort)
+	hookBead := lookupHookBead(ctx, actor)
+
 	// Emit the event
-	payload := events.SessionPayload(sessionID, actor, topic, ctx.WorkDir)
+	payload := events.SessionPayload(sessionID, actor, topic, ctx.WorkDir, hookBead)
 	_ = events.LogFeed(events.TypeSessionStart, actor, payload)
+}
+
+// lookupHookBead does a best-effort lookup of the hook_bead from the agent bead.
+// Returns empty string if lookup fails (non-fatal).
+func lookupHookBead(ctx RoleContext, agentID string) string {
+	agentBeadID := buildAgentBeadID(agentID, ctx.Role, ctx.TownRoot)
+	if agentBeadID == "" {
+		return ""
+	}
+	agentBeadDir := beads.ResolveHookDir(ctx.TownRoot, agentBeadID, ctx.WorkDir)
+	ab := beads.New(agentBeadDir)
+	agentBead, err := ab.Show(agentBeadID)
+	if err != nil || agentBead == nil {
+		return ""
+	}
+	return agentBead.HookBead
 }
 
 // outputSessionMetadata prints a structured metadata line for seance discovery.
