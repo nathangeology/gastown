@@ -766,33 +766,77 @@ type FormulaOnBeadResult struct {
 // InstantiateFormulaOnBead creates a wisp from a formula, bonds it to a bead.
 // This is the formula-on-bead pattern used by issue #288 for auto-applying mol-polecat-work.
 //
+// Primary path (gs-4i8): uses a single `bd mol bond <formula> <bead> --ephemeral`
+// call which does cook+wisp+bond atomically in one Dolt transaction, eliminating
+// 2 subprocess spawns and 2 round-trips (~200-500ms savings).
+//
+// Legacy fallback: if the direct bond fails (older bd versions), falls back to
+// the 3-step cook → wisp → bond sequence.
+//
 // Parameters:
 //   - formulaName: the formula to instantiate (e.g., "mol-polecat-work")
 //   - beadID: the base bead to bond the wisp to
 //   - title: the bead title (used for --var feature=<title>)
 //   - hookWorkDir: working directory for bd commands (polecat's worktree)
 //   - townRoot: the town root directory
-//   - skipCook: if true, skip cooking (for batch mode optimization where cook happens once)
+//   - skipCook: if true, skip cooking in legacy fallback (batch mode optimization)
 //   - extraVars: additional --var values supplied by the user
 //
 // Returns the wisp root ID which should be hooked.
 func InstantiateFormulaOnBead(ctx context.Context, formulaName, beadID, title, hookWorkDir, townRoot string, skipCook bool, extraVars []string) (_ *FormulaOnBeadResult, retErr error) {
 	defer func() { telemetry.RecordFormulaInstantiate(ctx, formulaName, beadID, retErr) }()
-	// Route bd mutations (wisp/bond) to the correct beads context for the target bead.
 	formulaWorkDir := beads.ResolveHookDir(townRoot, beadID, hookWorkDir)
 
-	// Step 1: Cook the formula (ensures proto exists)
-	// If cook fails, retry with the embedded formula extracted to a temp file.
-	// This handles non-gastown rigs that don't have formulas provisioned on disk.
-	// See gt-oir.
+	// Build variable list once for both primary and fallback paths.
+	featureVar := fmt.Sprintf("feature=%s", title)
+	issueVar := fmt.Sprintf("issue=%s", beadID)
+	formulaVars := []string{featureVar, issueVar}
+	formulaVars = append(formulaVars, extraVars...)
+	formulaVars = ensureFormulaRequiredVars(formulaName, formulaVars)
+
+	// Primary path (gs-4i8): single atomic bd mol bond call.
+	// bd mol bond <formula> <bead> --ephemeral does cook+wisp+bond in one Dolt transaction.
+	rootID, err := bondFormulaDirect(formulaName, beadID, formulaWorkDir, townRoot, formulaVars)
+	if err == nil {
+		telemetry.RecordMolCook(ctx, formulaName, nil)
+		telemetry.RecordMolWisp(ctx, formulaName, rootID, beadID, nil)
+		return &FormulaOnBeadResult{
+			WispRootID: rootID,
+			BeadToHook: beadID,
+		}, nil
+	}
+
+	// Primary path failed — try with embedded formula temp file before falling back to legacy.
+	resolvedFormula, formulaCleanup := resolveFormulaToTempFile(formulaName)
+	if formulaCleanup != nil {
+		defer formulaCleanup()
+	}
+	if resolvedFormula != formulaName {
+		rootID, retryErr := bondFormulaDirect(resolvedFormula, beadID, formulaWorkDir, townRoot, formulaVars)
+		if retryErr == nil {
+			telemetry.RecordMolCook(ctx, formulaName, nil)
+			telemetry.RecordMolWisp(ctx, formulaName, rootID, beadID, nil)
+			return &FormulaOnBeadResult{
+				WispRootID: rootID,
+				BeadToHook: beadID,
+			}, nil
+		}
+	}
+
+	// Legacy fallback: 3-step cook → wisp → bond for older bd versions.
+	return instantiateFormulaLegacy(ctx, formulaName, beadID, formulaWorkDir, townRoot, skipCook, featureVar, issueVar, extraVars, formulaVars)
+}
+
+// instantiateFormulaLegacy is the pre-gs-4i8 3-step cook → wisp → bond path.
+// Used as fallback when the atomic bd mol bond <formula> path is unavailable.
+func instantiateFormulaLegacy(ctx context.Context, formulaName, beadID, formulaWorkDir, townRoot string, skipCook bool, featureVar, issueVar string, extraVars, formulaVars []string) (*FormulaOnBeadResult, error) {
 	resolvedFormula := formulaName
 	var formulaCleanup func()
 	if !skipCook {
 		if err := BdCmd("cook", formulaName).
 			Dir(formulaWorkDir).
 			WithGTRoot(townRoot).
-				Run(); err != nil {
-			// Retry with embedded formula
+			Run(); err != nil {
 			resolvedFormula, formulaCleanup = resolveFormulaToTempFile(formulaName)
 			if formulaCleanup != nil {
 				defer formulaCleanup()
@@ -813,17 +857,6 @@ func InstantiateFormulaOnBead(ctx context.Context, formulaName, beadID, title, h
 		telemetry.RecordMolCook(ctx, formulaName, nil)
 	}
 
-	// Build variable list once so both legacy and fallback paths use
-	// identical formula inputs.
-	featureVar := fmt.Sprintf("feature=%s", title)
-	issueVar := fmt.Sprintf("issue=%s", beadID)
-	formulaVars := []string{featureVar, issueVar}
-	formulaVars = append(formulaVars, extraVars...)
-	formulaVars = ensureFormulaRequiredVars(formulaName, formulaVars)
-
-	// Step 2: Create wisp with feature and issue variables from bead.
-	// Use resolvedFormula which may be a temp file path if the embedded fallback was used.
-	// Root-only: don't materialize child step wisps — agents read inline steps from embedded formula.
 	wispArgs := []string{"mol", "wisp", resolvedFormula, "--var", featureVar, "--var", issueVar}
 	for _, variable := range extraVars {
 		wispArgs = append(wispArgs, "--var", variable)
@@ -838,7 +871,6 @@ func InstantiateFormulaOnBead(ctx context.Context, formulaName, beadID, title, h
 		return nil, fmt.Errorf("creating wisp for formula %s: %w", formulaName, err)
 	}
 
-	// Parse wisp output to get the root ID
 	wispRootID, err := parseWispIDFromJSON(wispOut)
 	if err != nil {
 		telemetry.RecordMolWisp(ctx, formulaName, "", beadID, err)
@@ -846,16 +878,6 @@ func InstantiateFormulaOnBead(ctx context.Context, formulaName, beadID, title, h
 	}
 	telemetry.RecordMolWisp(ctx, formulaName, wispRootID, beadID, nil)
 
-	// Step 3: Bond wisp to original bead (creates compound).
-	//
-	// Compatibility fallback:
-	// Some bd versions return a wisp ID from `mol wisp` that is not bond-resolvable
-	// ("<id> not found"), while direct formula->bead bond still works. If legacy
-	// wisp->bead bond fails, retry with direct formula bond in ephemeral mode.
-	//
-	// gt-4gjd: Warn about malformed wisp IDs (e.g., doubled "-wisp-" like "oag-wisp-wisp-rsia")
-	// but proceed — they are valid in the DB and bond correctly. The bd-side fix is ef57293e
-	// (not yet released).
 	if isMalformedWispID(wispRootID) {
 		fmt.Fprintf(os.Stderr, "Warning: bd mol wisp returned malformed ID %q (known bd bug, proceeding with bond)\n", wispRootID)
 	}
@@ -867,34 +889,27 @@ func InstantiateFormulaOnBead(ctx context.Context, formulaName, beadID, title, h
 		WithGTRoot(townRoot).
 		Output()
 	if err != nil {
-		// Clean up orphaned wisp from the failed legacy path.
 		cleanupOrphanedWisp(wispRootID, formulaWorkDir)
-
 		fallbackRootID, fallbackErr := bondFormulaDirect(resolvedFormula, beadID, formulaWorkDir, townRoot, formulaVars)
 		if fallbackErr != nil {
 			return nil, fmt.Errorf("bonding formula to bead: %w (direct formula bond fallback failed: %v)", err, fallbackErr)
 		}
 		return &FormulaOnBeadResult{
 			WispRootID: fallbackRootID,
-			BeadToHook: beadID, // Hook the BASE bead (lifecycle fix: wisp is attached_molecule)
+			BeadToHook: beadID,
 		}, nil
 	}
 
-	// Parse bond output - the wisp root becomes the compound root.
-	// Some environments may return success with non-JSON/empty stdout while
-	// still writing an error to stderr. If parsing fails, retry direct bond.
 	parsedRootID, parsed := parseBondSpawnRootIDWithStatus(bondOut, formulaName, beadID, wispRootID)
 	if !parsed {
-		// gt-4gjd: Clean up orphaned wisp before fallback.
 		cleanupOrphanedWisp(wispRootID, formulaWorkDir)
-
 		fallbackRootID, fallbackErr := bondFormulaDirect(resolvedFormula, beadID, formulaWorkDir, townRoot, formulaVars)
 		if fallbackErr != nil {
 			return nil, fmt.Errorf("bond output not parseable and direct formula bond fallback failed: %v", fallbackErr)
 		}
 		return &FormulaOnBeadResult{
 			WispRootID: fallbackRootID,
-			BeadToHook: beadID, // Hook the BASE bead (lifecycle fix: wisp is attached_molecule)
+			BeadToHook: beadID,
 		}, nil
 	}
 	if parsedRootID != "" {
@@ -903,13 +918,14 @@ func InstantiateFormulaOnBead(ctx context.Context, formulaName, beadID, title, h
 
 	return &FormulaOnBeadResult{
 		WispRootID: wispRootID,
-		BeadToHook: beadID, // Hook the BASE bead (lifecycle fix: wisp is attached_molecule)
+		BeadToHook: beadID,
 	}, nil
 }
 
-// bondFormulaDirect retries formula attachment using direct formula->bead bond.
-// Newer bd versions support this polymorphic path even when legacy wisp->bead
-// bonding fails with "not found" for the generated wisp ID.
+// bondFormulaDirect performs atomic formula instantiation using a single
+// `bd mol bond <formula> <bead> --ephemeral` call. This does cook+wisp+bond
+// in one Dolt transaction, eliminating 2 subprocess spawns and 2 round-trips
+// compared to the legacy 3-step path (gs-4i8).
 func bondFormulaDirect(formulaName, beadID, formulaWorkDir, townRoot string, vars []string) (string, error) {
 	bondArgs := []string{"mol", "bond", formulaName, beadID, "--json", "--ephemeral"}
 	for _, variable := range vars {
