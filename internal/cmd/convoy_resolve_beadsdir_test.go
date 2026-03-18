@@ -31,7 +31,10 @@ func TestConvoyResolveBeadsDir_RegressionEmptyConvoy(t *testing.T) {
 			t.Skip("skipping on windows")
 		}
 
-		townRoot := t.TempDir()
+		townRoot, err := filepath.EvalSymlinks(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
 		if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
 			t.Fatal(err)
 		}
