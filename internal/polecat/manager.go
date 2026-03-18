@@ -293,6 +293,46 @@ func (m *Manager) CheckDoltServerCapacity() error {
 	return nil
 }
 
+// CheckDoltPreSpawn verifies Dolt health and connection capacity in a single SQL
+// round-trip (gs-9na). Replaces the sequential CheckDoltHealth + CheckDoltServerCapacity
+// calls, saving ~50-200ms per spawn. Uses the same retry/backoff logic as CheckDoltHealth
+// for transient failures, and the same fail-closed semantics as CheckDoltServerCapacity.
+func (m *Manager) CheckDoltPreSpawn() error {
+	townRoot, err := workspace.Find(m.rig.Path)
+	if err != nil || townRoot == "" {
+		return nil // Can't determine town root, skip check
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= doltMaxRetries; attempt++ {
+		err := doltserver.CheckPreSpawnHealth(townRoot)
+		if err == nil {
+			return nil
+		}
+		// Connection refused means Dolt isn't running — fail fast like isDoltConfigError
+		if strings.Contains(err.Error(), "connection refused") {
+			return fmt.Errorf("%w: %v", ErrDoltUnhealthy, err)
+		}
+		lastErr = err
+		if attempt < doltMaxRetries {
+			backoff := doltBackoff(attempt)
+			style.PrintWarning("Pre-spawn health check attempt %d failed, retrying in %v...", attempt, backoff)
+			time.Sleep(backoff)
+		}
+	}
+
+	// If the persistent failure looks like read-only, attempt server recovery
+	if lastErr != nil && doltserver.IsReadOnlyError(lastErr.Error()) {
+		if recoverErr := doltserver.RecoverReadOnly(townRoot); recoverErr == nil {
+			if err := doltserver.CheckPreSpawnHealth(townRoot); err == nil {
+				return nil
+			}
+		}
+	}
+
+	return fmt.Errorf("%w: %v", ErrDoltUnhealthy, lastErr)
+}
+
 // createAgentBeadWithRetry wraps CreateOrReopenAgentBead with retry logic.
 // For transient Dolt failures (server exists but write fails), retries with backoff
 // and fails hard — a polecat without an agent bead is untrackable.
@@ -501,6 +541,7 @@ func (m *Manager) exists(name string) bool {
 type AddOptions struct {
 	HookBead   string // Bead ID to set as hook_bead at spawn time (atomic assignment)
 	BaseBranch string // Override base branch for worktree (e.g., "origin/integration/gt-epic")
+	SkipFetch  bool   // Skip git fetch origin (caller already fetched)
 }
 
 // Add creates a new polecat as a git worktree from the repo base.
@@ -690,6 +731,9 @@ func (m *Manager) AllocateAndAdd(opts AddOptions) (string, *Polecat, error) {
 func (m *Manager) addWithOptionsLocked(name string, opts AddOptions, polecatDir string) (_ *Polecat, retErr error) {
 	defer func() { telemetry.RecordPolecatSpawn(context.Background(), name, retErr) }()
 
+	prof := newManagerProfile()
+	defer prof.report("addWithOptionsLocked")
+
 	clonePath := filepath.Join(polecatDir, m.rig.Name)
 	branchName := m.buildBranchName(name, opts.HookBead)
 
@@ -717,10 +761,14 @@ func (m *Manager) addWithOptionsLocked(name string, opts AddOptions, polecatDir 
 		return nil, fmt.Errorf("finding repo base: %w", err)
 	}
 
-	if err := repoGit.Fetch("origin"); err != nil {
-		style.PrintWarning("could not fetch origin: %v", err)
+	if !opts.SkipFetch {
+		prof.begin("fetch-origin")
+		if err := repoGit.Fetch("origin"); err != nil {
+			style.PrintWarning("could not fetch origin: %v", err)
+		}
 	}
 
+	prof.begin("resolve-startpoint")
 	var startPoint string
 	if opts.BaseBranch != "" {
 		startPoint = opts.BaseBranch
@@ -746,17 +794,20 @@ func (m *Manager) addWithOptionsLocked(name string, opts AddOptions, polecatDir 
 			startPoint, m.rig.Path, filepath.Join(m.rig.Path, ".repo.git"))
 	}
 
+	prof.begin("worktree-add")
 	if err := repoGit.WorktreeAddFromRef(clonePath, branchName, startPoint); err != nil {
 		cleanupOnError()
 		return nil, fmt.Errorf("creating worktree from %s: %w", startPoint, err)
 	}
 	worktreeCreated = true
 
+	prof.begin("setup-shared-beads")
 	if err := m.setupSharedBeads(clonePath); err != nil {
 		cleanupOnError()
 		return nil, fmt.Errorf("setting up shared beads: %w (polecat cannot submit MRs without shared beads)", err)
 	}
 
+	prof.begin("provision-and-overlay")
 	if err := beads.ProvisionPrimeMDForWorktree(clonePath); err != nil {
 		style.PrintWarning("could not provision PRIME.md: %v", err)
 	}
@@ -769,6 +820,7 @@ func (m *Manager) addWithOptionsLocked(name string, opts AddOptions, polecatDir 
 		style.PrintWarning("could not update local git excludes: %v", err)
 	}
 
+	prof.begin("runtime-settings")
 	townRoot := filepath.Dir(m.rig.Path)
 	runtimeConfig := config.ResolveRoleAgentConfig("polecat", townRoot, m.rig.Path)
 	polecatSettingsDir := config.RoleSettingsDir("polecat", m.rig.Path)
@@ -776,10 +828,12 @@ func (m *Manager) addWithOptionsLocked(name string, opts AddOptions, polecatDir 
 		style.PrintWarning("could not install runtime settings: %v", err)
 	}
 
+	prof.begin("setup-hooks")
 	if err := rig.RunSetupHooks(m.rig.Path, clonePath); err != nil {
 		style.PrintWarning("could not run setup hooks: %v", err)
 	}
 
+	prof.begin("agent-bead-create")
 	agentID := m.agentBeadID(name)
 	if err = m.createAgentBeadWithRetry(agentID, &beads.AgentFields{
 		RoleType:   "polecat",
@@ -876,9 +930,11 @@ func (m *Manager) AddWithOptions(name string, opts AddOptions) (_ *Polecat, retE
 	}
 
 	// Fetch latest from origin to ensure worktree starts from up-to-date code
-	if err := repoGit.Fetch("origin"); err != nil {
-		// Non-fatal - proceed with potentially stale code
-		style.PrintWarning("could not fetch origin: %v", err)
+	if !opts.SkipFetch {
+		if err := repoGit.Fetch("origin"); err != nil {
+			// Non-fatal - proceed with potentially stale code
+			style.PrintWarning("could not fetch origin: %v", err)
+		}
 	}
 
 	// Determine the start point for the new worktree
@@ -1355,7 +1411,9 @@ func (m *Manager) RepairWorktreeWithOptions(name string, force bool, opts AddOpt
 	}
 
 	// Fetch latest from origin to ensure we have fresh commits (non-fatal: may be offline)
-	_ = repoGit.Fetch("origin")
+	if !opts.SkipFetch {
+		_ = repoGit.Fetch("origin")
+	}
 
 	// Ensure polecat directory exists for new structure
 	if err := os.MkdirAll(polecatDir, 0755); err != nil {
@@ -1539,13 +1597,15 @@ func (m *Manager) ReuseIdlePolecat(name string, opts AddOptions) (*Polecat, erro
 
 	polecatGit := git.NewGit(clonePath)
 
-	// Fetch latest from origin (non-fatal: may be offline)
-	repoGit, err := m.repoBase()
-	if err == nil {
-		_ = repoGit.Fetch("origin")
+	if !opts.SkipFetch {
+		// Fetch latest from origin (non-fatal: may be offline)
+		repoGit, err := m.repoBase()
+		if err == nil {
+			_ = repoGit.Fetch("origin")
+		}
+		// Also fetch in the worktree itself so it has the latest refs
+		_ = polecatGit.Fetch("origin")
 	}
-	// Also fetch in the worktree itself so it has the latest refs
-	_ = polecatGit.Fetch("origin")
 
 	// Determine the start point for the new branch
 	var startPoint string

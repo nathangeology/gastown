@@ -1,12 +1,15 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"runtime"
 	"strconv"
+	"syscall"
 	"time"
 
 	"golang.org/x/term"
@@ -36,9 +39,14 @@ The dashboard shows real-time convoy status with:
 - Last activity indicator (green/yellow/red)
 - Auto-refresh every 30 seconds via htmx
 
+If the default port (8080) is in use, the dashboard automatically tries
+the next port (up to 10 attempts). Use --port 0 to let the OS assign
+a free port. The actual port is printed on startup.
+
 Example:
-  gt dashboard                    # Start on default port 8080
+  gt dashboard                    # Start on default port 8080 (auto-increment on conflict)
   gt dashboard --port 3000        # Start on port 3000
+  gt dashboard --port 0           # Let the OS pick a free port
   gt dashboard --bind 0.0.0.0     # Listen on all interfaces
   gt dashboard --open             # Start and open browser`,
 	RunE: runDashboard,
@@ -94,8 +102,16 @@ func runDashboard(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Build the listen address and display URL
-	listenAddr := fmt.Sprintf("%s:%d", dashboardBind, dashboardPort)
+	// Listen with port fallback
+	ln, err := listenWithFallback(dashboardBind, dashboardPort)
+	if err != nil {
+		return fmt.Errorf("could not find available port: %w", err)
+	}
+	defer ln.Close()
+
+	// Resolve actual port (important for --port 0 and auto-increment)
+	actualPort := ln.Addr().(*net.TCPAddr).Port
+
 	displayHost := dashboardBind
 	if displayHost == "0.0.0.0" {
 		if hostname, err := os.Hostname(); err == nil {
@@ -104,7 +120,7 @@ func runDashboard(cmd *cobra.Command, args []string) error {
 			displayHost = "localhost"
 		}
 	}
-	url := fmt.Sprintf("http://%s:%d", displayHost, dashboardPort)
+	url := fmt.Sprintf("http://%s:%d", displayHost, actualPort)
 
 	// Open browser if requested
 	if dashboardOpen {
@@ -140,17 +156,17 @@ func runDashboard(cmd *cobra.Command, args []string) error {
 	} else {
 		fmt.Print("\n  WELCOME TO GASTOWN\n\n")
 	}
+	listenAddr := ln.Addr().String()
 	fmt.Printf("  launching dashboard at %s  •  api: %s/api/  •  listening on %s  •  ctrl+c to stop\n", url, url, listenAddr)
 
 	server := &http.Server{
-		Addr:              listenAddr,
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
-	return server.ListenAndServe()
+	return server.Serve(ln)
 }
 
 // ensureDoltPortEnv sets GT_DOLT_PORT, BEADS_DOLT_PORT, and BEADS_DOLT_SERVER_HOST
@@ -174,6 +190,48 @@ func ensureDoltPortEnv(townRoot string) {
 	if doltCfg.Host != "" {
 		os.Setenv("BEADS_DOLT_SERVER_HOST", doltCfg.Host)
 	}
+}
+
+// maxPortRetries is the number of consecutive ports to try on EADDRINUSE.
+const maxPortRetries = 10
+
+// listenWithFallback tries to listen on bind:port. If port is 0, the OS picks
+// a free port. Otherwise, on EADDRINUSE it auto-increments the port up to
+// maxPortRetries times.
+func listenWithFallback(bind string, port int) (net.Listener, error) {
+	// --port 0: let the OS assign a free port, no retry needed
+	if port == 0 {
+		return net.Listen("tcp", fmt.Sprintf("%s:0", bind))
+	}
+
+	var lastErr error
+	for i := 0; i < maxPortRetries; i++ {
+		addr := fmt.Sprintf("%s:%d", bind, port+i)
+		ln, err := net.Listen("tcp", addr)
+		if err == nil {
+			if i > 0 {
+				fmt.Fprintf(os.Stderr, "note: port %d in use, using %d instead\n", port, port+i)
+			}
+			return ln, nil
+		}
+		lastErr = err
+		if !isAddrInUse(err) {
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("ports %d-%d all in use: %w", port, port+maxPortRetries-1, lastErr)
+}
+
+// isAddrInUse reports whether err is an EADDRINUSE error.
+func isAddrInUse(err error) bool {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		var sysErr *os.SyscallError
+		if errors.As(opErr.Err, &sysErr) {
+			return errors.Is(sysErr.Err, syscall.EADDRINUSE)
+		}
+	}
+	return false
 }
 
 // openBrowser opens the specified URL in the default browser.

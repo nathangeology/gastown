@@ -7,7 +7,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
@@ -61,7 +60,11 @@ type SlingSpawnOptions struct {
 // This is used by gt sling when the target is a rig name.
 // The caller (sling) handles hook attachment and nudging.
 func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+	prof := NewSlingProfile()
+	defer prof.Report()
+
 	// Find workspace
+	prof.Begin("spawn/find-workspace")
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
 		return nil, fmt.Errorf("not in a Gas Town workspace: %w", err)
@@ -86,22 +89,19 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 	t := tmux.NewTmux()
 	polecatMgr := polecat.NewManager(r, polecatGit, t)
 
-	// Pre-spawn Dolt health check (gt-94llt7): verify Dolt is reachable before
-	// allocating a polecat. Prevents orphaned polecats when Dolt is down.
-	if err := polecatMgr.CheckDoltHealth(); err != nil {
-		return nil, fmt.Errorf("pre-spawn health check failed: %w", err)
-	}
-
-	// Pre-spawn admission control (gt-1obzke): verify Dolt server has connection
-	// capacity before spawning. Prevents connection storms during mass sling.
-	if err := polecatMgr.CheckDoltServerCapacity(); err != nil {
-		return nil, fmt.Errorf("admission control: %w", err)
+	// Pre-spawn health + capacity check (gs-9na): single SQL round-trip verifies
+	// Dolt is reachable AND has connection capacity. Replaces sequential dolt-health
+	// + dolt-capacity checks, saving ~50-200ms.
+	prof.Begin("spawn/dolt-pre-spawn")
+	if err := polecatMgr.CheckDoltPreSpawn(); err != nil {
+		return nil, fmt.Errorf("pre-spawn check failed: %w", err)
 	}
 
 	// Polecat count cap (clown show #22): refuse to spawn if there are already
 	// too many active polecats. This is a last-resort safety net for the direct-dispatch
 	// path. For configurable capacity gating, use scheduler.max_polecats in town settings
 	// (see internal/scheduler/capacity/).
+	prof.Begin("spawn/cap-checks")
 	const defaultMaxActivePolecats = 25
 	activeCount := countActivePolecats()
 	if activeCount >= defaultMaxActivePolecats {
@@ -145,9 +145,20 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 		}
 	}
 
+	// Fetch origin once for the entire sling path (gs-4j3). Downstream methods
+	// (addWithOptionsLocked, ReuseIdlePolecat, RepairWorktreeWithOptions) receive
+	// SkipFetch=true so they don't repeat this network round-trip.
+	prof.Begin("spawn/fetch-origin")
+	if repoGit, err := getRigGit(r.Path); err == nil {
+		if err := repoGit.Fetch("origin"); err != nil {
+			style.PrintWarning("could not fetch origin: %v", err)
+		}
+	}
+
 	// Persistent polecat model (gt-4ac): try to reuse an idle polecat first.
 	// Idle polecats have completed their work but kept their sandbox (worktree).
 	// Reusing avoids the overhead of creating a new worktree.
+	prof.Begin("spawn/find-idle")
 	idlePolecat, findErr := polecatMgr.FindIdlePolecat()
 	if findErr == nil && idlePolecat != nil {
 		polecatName := idlePolecat.Name
@@ -183,6 +194,7 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 		addOpts := polecat.AddOptions{
 			HookBead:   opts.HookBead,
 			BaseBranch: baseBranch,
+			SkipFetch:  true,
 		}
 		reuseOK := false
 		if _, err := polecatMgr.ReuseIdlePolecat(polecatName, addOpts); err != nil {
@@ -260,11 +272,13 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 	addOpts := polecat.AddOptions{
 		HookBead:   opts.HookBead,
 		BaseBranch: baseBranch,
+		SkipFetch:  true,
 	}
 
 	// No idle polecat available — allocate and create atomically (GH#2215).
 	// AllocateAndAdd holds the pool lock through directory creation, preventing
 	// concurrent processes from allocating the same name.
+	prof.Begin("spawn/allocate-and-add")
 	polecatName, _, err := polecatMgr.AllocateAndAdd(addOpts)
 	if err != nil {
 		return nil, fmt.Errorf("allocating and creating polecat: %w", err)
@@ -369,28 +383,11 @@ func (s *SpawnedPolecatInfo) StartSession() (string, error) {
 		return "", fmt.Errorf("starting session: %w", err)
 	}
 
-	// Wait for runtime to be fully ready before returning.
-	// When an agent override is specified (e.g., --agent codex), resolve the runtime
-	// config from the override so WaitForRuntimeReady uses the correct readiness
-	// strategy (delay-based for Codex vs prompt-polling for Claude). Without this,
-	// ResolveRoleAgentConfig returns the default agent (Claude) and polls for "❯ "
-	// in a Codex session, always timing out after 30 seconds (gt-1j3m).
-	spawnTownRoot := filepath.Dir(r.Path)
-	var runtimeConfig *config.RuntimeConfig
-	if s.agent != "" {
-		rc, _, err := config.ResolveAgentConfigWithOverride(spawnTownRoot, r.Path, s.agent)
-		if err != nil {
-			style.PrintWarning("resolving agent config for %s: %v (using default)", s.agent, err)
-			runtimeConfig = config.ResolveRoleAgentConfig("polecat", spawnTownRoot, r.Path)
-		} else {
-			runtimeConfig = rc
-		}
-	} else {
-		runtimeConfig = config.ResolveRoleAgentConfig("polecat", spawnTownRoot, r.Path)
-	}
-	if err := t.WaitForRuntimeReady(s.SessionName, runtimeConfig, 30*time.Second); err != nil {
-		style.PrintWarning("runtime may not be fully ready: %v", err)
-	}
+	// Hybrid fast-sling (gs-9hc): skip synchronous WaitForRuntimeReady.
+	// The SessionStart hook runs gt prime --hook automatically, so the agent
+	// discovers work via its hook. WaitForRuntimeReady added 5-25s of prompt
+	// polling that degrades gracefully on timeout anyway. The async verification
+	// goroutine (asyncVerifyAgentWorking) in the caller provides a safety net.
 
 	// Update agent state with retry logic (gt-94llt7: fail-safe Dolt writes).
 	// Note: warn-only, not fail-hard. The tmux session is already started above,

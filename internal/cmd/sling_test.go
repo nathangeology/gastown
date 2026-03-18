@@ -142,7 +142,7 @@ func TestSlingFormulaOnBeadRoutesBDCommandsToTargetRig(t *testing.T) {
 		t.Fatalf("write routes.jsonl: %v", err)
 	}
 
-	// Stub bd so we can observe the working directory for cook/wisp/bond.
+	// Stub bd so we can observe the working directory for bond commands.
 	binDir := filepath.Join(townRoot, "bin")
 	if err := os.MkdirAll(binDir, 0755); err != nil {
 		t.Fatalf("mkdir binDir: %v", err)
@@ -173,7 +173,13 @@ case "$cmd" in
         echo '{"new_epic_id":"gt-wisp-xyz"}'
         ;;
       bond)
-        echo '{"root_id":"gt-wisp-xyz"}'
+        left="$1"
+        shift || true
+        if echo "$left" | grep -q "^mol-"; then
+          echo '{"result_id":"gt-abc123","id_mapping":{"'"$left"'":"gt-wisp-xyz"}}'
+        else
+          echo '{"root_id":"gt-wisp-xyz"}'
+        fi
         ;;
     esac
     ;;
@@ -185,6 +191,7 @@ setlocal enableextensions
 echo %CD%^|%*>>"%BD_LOG%"
 set "cmd=%1"
 set "sub=%2"
+set "left=%3"
 if "%cmd%"=="show" (
   echo [{"title":"Test issue","status":"open","assignee":"","description":""}]
   exit /b 0
@@ -200,7 +207,7 @@ if "%cmd%"=="mol" (
     exit /b 0
   )
   if "%sub%"=="bond" (
-    echo {"root_id":"gt-wisp-xyz"}
+    echo {"result_id":"gt-abc123","id_mapping":{"mol-review":"gt-wisp-xyz"}}
     exit /b 0
   )
 )
@@ -261,8 +268,6 @@ exit /b 0
 	if resolved, err := filepath.EvalSymlinks(wantDir); err == nil {
 		wantDir = resolved
 	}
-	gotCook := false
-	gotWisp := false
 	gotBond := false
 
 	for _, line := range logLines {
@@ -276,16 +281,7 @@ exit /b 0
 		}
 		args := parts[1]
 
-		switch {
-		case strings.Contains(args, "cook "):
-			gotCook = true
-			// cook doesn't need database context, runs from cwd
-		case strings.Contains(args, "mol wisp "):
-			gotWisp = true
-			if dir != wantDir {
-				t.Fatalf("bd mol wisp ran in %q, want %q (args: %q)", dir, wantDir, args)
-			}
-		case strings.Contains(args, "mol bond "):
+		if strings.Contains(args, "mol bond ") {
 			gotBond = true
 			if dir != wantDir {
 				t.Fatalf("bd mol bond ran in %q, want %q (args: %q)", dir, wantDir, args)
@@ -293,8 +289,8 @@ exit /b 0
 		}
 	}
 
-	if !gotCook || !gotWisp || !gotBond {
-		t.Fatalf("missing expected bd commands: cook=%v wisp=%v bond=%v (log: %q)", gotCook, gotWisp, gotBond, string(logBytes))
+	if !gotBond {
+		t.Fatalf("missing expected bd mol bond command (log: %q)", string(logBytes))
 	}
 }
 
@@ -808,7 +804,7 @@ exit /b 0
 
 // TestSlingFormulaOnBeadPassesFeatureAndIssueVars verifies that when using
 // gt sling <formula> --on <bead>, both --var feature=<title> and --var issue=<beadID>
-// are passed to the bd mol wisp command.
+// are passed to the bd mol bond command (gs-4i8: atomic path).
 func TestSlingFormulaOnBeadPassesFeatureAndIssueVars(t *testing.T) {
 	townRoot := t.TempDir()
 
@@ -834,7 +830,7 @@ func TestSlingFormulaOnBeadPassesFeatureAndIssueVars(t *testing.T) {
 		t.Fatalf("write routes.jsonl: %v", err)
 	}
 
-	// Stub bd so we can observe the arguments passed to mol wisp.
+	// Stub bd so we can observe the arguments passed to mol bond.
 	binDir := filepath.Join(townRoot, "bin")
 	if err := os.MkdirAll(binDir, 0755); err != nil {
 		t.Fatalf("mkdir binDir: %v", err)
@@ -851,7 +847,6 @@ case "$cmd" in
     echo '[{"title":"My Test Feature","status":"open","assignee":"","description":""}]'
     ;;
   formula)
-    # formula show <name> - must output something for verifyFormulaExists
     echo '{"name":"mol-review"}'
     exit 0
     ;;
@@ -866,7 +861,13 @@ case "$cmd" in
         echo '{"new_epic_id":"gt-wisp-xyz"}'
         ;;
       bond)
-        echo '{"root_id":"gt-wisp-xyz"}'
+        left="$1"
+        shift || true
+        if echo "$left" | grep -q "^mol-"; then
+          echo '{"result_id":"gt-abc123","id_mapping":{"'"$left"'":"gt-wisp-xyz"}}'
+        else
+          echo '{"root_id":"gt-wisp-xyz"}'
+        fi
         ;;
     esac
     ;;
@@ -878,6 +879,7 @@ setlocal enableextensions
 echo ARGS:%*>>"%BD_LOG%"
 set "cmd=%1"
 set "sub=%2"
+set "left=%3"
 if "%cmd%"=="show" (
   echo [{^"title^":^"My Test Feature^",^"status^":^"open^",^"assignee^":^"^",^"description^":^"^"}]
   exit /b 0
@@ -893,7 +895,7 @@ if "%cmd%"=="mol" (
     exit /b 0
   )
   if "%sub%"=="bond" (
-    echo {^"root_id^":^"gt-wisp-xyz^"}
+    echo {^"result_id^":^"gt-abc123^",^"id_mapping^":{^"mol-review^":^"gt-wisp-xyz^"}}
     exit /b 0
   )
 )
@@ -949,28 +951,28 @@ exit /b 0
 		t.Fatalf("read bd log: %v", err)
 	}
 
-	// Find the mol wisp command and verify both --var arguments
+	// gs-4i8: Find the atomic bond command and verify both --var arguments
 	logLines := strings.Split(string(logBytes), "\n")
-	var wispLine string
+	var bondLine string
 	for _, line := range logLines {
-		if strings.Contains(line, "mol wisp") {
-			wispLine = line
+		if strings.Contains(line, "mol bond mol-review") {
+			bondLine = line
 			break
 		}
 	}
 
-	if wispLine == "" {
-		t.Fatalf("mol wisp command not found in log: %s", string(logBytes))
+	if bondLine == "" {
+		t.Fatalf("mol bond command not found in log: %s", string(logBytes))
 	}
 
 	// Verify --var feature=<title> is present
-	if !containsVarArg(wispLine, "feature", "My Test Feature") {
-		t.Errorf("mol wisp missing --var feature=<title>\ngot: %s", wispLine)
+	if !containsVarArg(bondLine, "feature", "My Test Feature") {
+		t.Errorf("mol bond missing --var feature=<title>\ngot: %s", bondLine)
 	}
 
 	// Verify --var issue=<beadID> is present
-	if !containsVarArg(wispLine, "issue", "gt-abc123") {
-		t.Errorf("mol wisp missing --var issue=<beadID>\ngot: %s", wispLine)
+	if !containsVarArg(bondLine, "issue", "gt-abc123") {
+		t.Errorf("mol bond missing --var issue=<beadID>\ngot: %s", bondLine)
 	}
 }
 
@@ -1486,7 +1488,7 @@ exit /b 0
 		t.Fatalf("runSling: %v", err)
 	}
 
-	// Check the molecule log file written by storeFieldsInBead (via GT_TEST_ATTACHED_MOLECULE_LOG).
+	// Check the molecule log file written by hookAndStoreFields (via GT_TEST_ATTACHED_MOLECULE_LOG).
 	// This directly captures the description content without relying on batch stub logging.
 	molBytes, err := os.ReadFile(molLogPath)
 	if err != nil {

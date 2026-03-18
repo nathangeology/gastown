@@ -1522,7 +1522,7 @@ func selfKillSession(townRoot string, roleInfo RoleInfo) error {
 
 	// Log to events (JSON audit log with structured payload)
 	_ = events.LogFeed(events.TypeSessionDeath, agentID,
-		events.SessionDeathPayload(sessionName, agentID, "self-clean: done means idle", "gt done"))
+		events.SessionDeathPayload(sessionName, agentID, "self-clean: done means idle", "gt done", os.Getenv("GT_WORK_BEAD")))
 
 	// Kill our own tmux session with proper process cleanup
 	// This will terminate Claude and all child processes, completing the self-cleaning cycle.

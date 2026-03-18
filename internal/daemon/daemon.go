@@ -2017,7 +2017,7 @@ func (d *Daemon) checkPolecatHealth(rigName, polecatName string) {
 
 	// Emit session_death event for audit trail / feed visibility
 	_ = events.LogFeed(events.TypeSessionDeath, sessionName,
-		events.SessionDeathPayload(sessionName, rigName+"/polecats/"+polecatName, "crash detected by daemon health check", "daemon"))
+		events.SessionDeathPayload(sessionName, rigName+"/polecats/"+polecatName, "crash detected by daemon health check", "daemon", info.HookBead))
 
 	// Notify witness — stuck-agent-dog plugin handles context-aware restart
 	d.notifyWitnessOfCrashedPolecat(rigName, polecatName, info.HookBead)
@@ -2230,7 +2230,7 @@ func (d *Daemon) killIdlePolecat(rigName, polecatName, sessionName string, idleD
 	_ = events.LogFeed(events.TypeSessionDeath, fmt.Sprintf("%s/%s", rigName, polecatName),
 		events.SessionDeathPayload(sessionName, fmt.Sprintf("%s/polecats/%s", rigName, polecatName),
 			fmt.Sprintf("idle-reap: %s, idle %v (threshold %v)", reason, idleDuration.Truncate(time.Second), timeout),
-			"daemon"))
+			"daemon", ""))
 }
 
 // cleanupOrphanedProcesses kills orphaned claude subagent processes.

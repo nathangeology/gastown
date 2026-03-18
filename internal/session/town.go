@@ -66,7 +66,7 @@ func stopTownSessionInternal(t *tmux.Tmux, ts TownSession, force bool) (bool, er
 		reason = "forced shutdown"
 	}
 	_ = events.LogFeed(events.TypeSessionDeath, ts.SessionID,
-		events.SessionDeathPayload(ts.SessionID, ts.Name, reason, "gt down"))
+		events.SessionDeathPayload(ts.SessionID, ts.Name, reason, "gt down", ""))
 
 	// Kill the session.
 	// Use KillSessionWithProcesses to ensure all descendant processes are killed.

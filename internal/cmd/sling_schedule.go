@@ -169,12 +169,13 @@ func scheduleBead(beadID, rigName string, opts ScheduleOptions) error {
 		return fmt.Errorf("creating sling context: %w", err)
 	}
 
-	// Auto-convoy (unless --no-convoy)
+	// Auto-convoy (unless --no-convoy) — deferred to background goroutine (gs-008).
 	if !opts.NoConvoy {
 		existingConvoy := isTrackedByConvoy(beadID)
 		if existingConvoy == "" {
-			convoyID, err := createAutoConvoy(beadID, info.Title, opts.Owned, opts.Merge, opts.BaseBranch)
-			if err != nil {
+			convoyFut := createAutoConvoyAsync(beadID, info.Title, opts.Owned, opts.Merge, opts.BaseBranch)
+			// Collect result — scheduler is deferred dispatch so blocking here is acceptable.
+			if convoyID, err := convoyFut.Wait(); err != nil {
 				fmt.Printf("%s Could not create auto-convoy: %v\n", style.Dim.Render("Warning:"), err)
 			} else {
 				fmt.Printf("%s Created convoy %s\n", style.Bold.Render("→"), convoyID)

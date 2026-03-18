@@ -243,18 +243,14 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 	targetAgent := spawnInfo.AgentID()
 	hookWorkDir := spawnInfo.ClonePath
 
-	// 4. Auto-convoy (if !NoConvoy)
-	convoyID := ""
+	// 4. Auto-convoy (if !NoConvoy) — deferred to background goroutine (gs-008).
+	// The convoy ID is only needed for rollback cleanup and field storage,
+	// both of which happen later in the pipeline.
+	var convoyFut *convoyFuture
 	if !params.NoConvoy {
 		existingConvoy := isTrackedByConvoy(params.BeadID)
 		if existingConvoy == "" {
-			var err error
-			convoyID, err = createAutoConvoy(params.BeadID, info.Title, params.Owned, params.Merge, params.BaseBranch)
-			if err != nil {
-				fmt.Printf("  %s Could not create auto-convoy: %v\n", style.Dim.Render("Warning:"), err)
-			} else {
-				fmt.Printf("  %s Created convoy %s\n", style.Bold.Render("→"), convoyID)
-			}
+			convoyFut = createAutoConvoyAsync(params.BeadID, info.Title, params.Owned, params.Merge, params.BaseBranch)
 		} else {
 			fmt.Printf("  %s Already tracked by convoy %s\n", style.Dim.Render("○"), existingConvoy)
 		}
@@ -266,8 +262,9 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		workDir := beads.ResolveHookDir(townRoot, params.BeadID, hookWorkDir)
 		if err := CookFormula(params.FormulaName, workDir, townRoot); err != nil {
 			if params.FormulaFailFatal {
-				// Rollback spawned polecat on fatal cook failure
-				rollbackSlingArtifactsFn(spawnInfo, params.BeadID, hookWorkDir, convoyID)
+				// Rollback spawned polecat on fatal cook failure.
+				// Use convoyFut.ID() for best-effort cleanup (non-blocking).
+				rollbackSlingArtifactsFn(spawnInfo, params.BeadID, hookWorkDir, convoyFut.ID())
 				result.ErrMsg = fmt.Sprintf("cook failed: %v", err)
 				return result, fmt.Errorf("cooking formula %s: %w", params.FormulaName, err)
 			}
@@ -301,8 +298,9 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		formulaResult, err := InstantiateFormulaOnBead(context.Background(), params.FormulaName, params.BeadID, info.Title, hookWorkDir, townRoot, true, allVars)
 		if err != nil {
 			if params.FormulaFailFatal {
-				// Rollback spawned polecat on fatal formula failure
-				rollbackSlingArtifactsFn(spawnInfo, params.BeadID, hookWorkDir, convoyID)
+				// Rollback spawned polecat on fatal formula failure.
+				// Use convoyFut.ID() for best-effort cleanup (non-blocking).
+				rollbackSlingArtifactsFn(spawnInfo, params.BeadID, hookWorkDir, convoyFut.ID())
 				result.ErrMsg = fmt.Sprintf("formula failed: %v", err)
 				return result, fmt.Errorf("instantiating formula %s: %w", params.FormulaName, err)
 			}
@@ -317,25 +315,21 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 	}
 	result.AttachedMolecule = attachedMoleculeID
 
-	// 7. Hook bead with retry
+	// 7. Hook bead and store fields in a single bd update call
+	actor := detectActor()
 	hookDir := beads.ResolveHookDir(townRoot, beadToHook, hookWorkDir)
-	if err := hookBeadWithRetry(beadToHook, targetAgent, hookDir); err != nil {
-		// Clean up orphaned polecat to avoid leaving spawned-but-unhookable polecats
-		cleanupSpawnedPolecat(spawnInfo, params.RigName, convoyID)
-		result.ErrMsg = "hook failed"
-		return result, fmt.Errorf("failed to hook bead: %w", err)
+
+	// Collect background convoy result before storing fields.
+	convoyID := ""
+	if convoyFut != nil {
+		if id, err := convoyFut.Wait(); err != nil {
+			fmt.Printf("  %s Could not create auto-convoy: %v\n", style.Dim.Render("Warning:"), err)
+		} else {
+			convoyID = id
+			fmt.Printf("  %s Created convoy %s\n", style.Bold.Render("→"), convoyID)
+		}
 	}
 
-	fmt.Printf("  %s Work attached to %s\n", style.Bold.Render("✓"), spawnInfo.PolecatName)
-
-	// 8. Log sling event
-	actor := detectActor()
-	_ = events.LogFeed(events.TypeSling, actor, events.SlingPayload(beadToHook, targetAgent))
-
-	// 9. Update agent hook_bead state
-	updateAgentHookBead(targetAgent, beadToHook, hookWorkDir, beadsDir)
-
-	// 10. Store fields in bead (dispatcher, args, attached_molecule, no_merge, mode)
 	fieldUpdates := beadFieldUpdates{
 		Dispatcher:       actor,
 		Args:             params.Args,
@@ -346,10 +340,20 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		Mode:             params.Mode,
 		FormulaVars:      strings.Join(allVars, "\n"),
 	}
-	// Use beadToHook for the update target (may differ from beadID when formula-on-bead)
-	if err := storeFieldsInBead(beadToHook, fieldUpdates); err != nil {
-		fmt.Printf("  %s Could not store fields in bead: %v\n", style.Dim.Render("Warning:"), err)
+	if err := hookAndStoreFields(beadToHook, targetAgent, hookDir, fieldUpdates); err != nil {
+		// Clean up orphaned polecat to avoid leaving spawned-but-unhookable polecats
+		cleanupSpawnedPolecat(spawnInfo, params.RigName, convoyID)
+		result.ErrMsg = "hook failed"
+		return result, fmt.Errorf("failed to hook bead: %w", err)
 	}
+
+	fmt.Printf("  %s Work attached to %s\n", style.Bold.Render("✓"), spawnInfo.PolecatName)
+
+	// 8. Log sling event
+	_ = events.LogFeed(events.TypeSling, actor, events.SlingPayload(beadToHook, targetAgent))
+
+	// 9. Update agent hook_bead state
+	updateAgentHookBead(targetAgent, beadToHook, hookWorkDir, beadsDir)
 
 	// Update agent bead mode (for stuck detector to identify ralphcats)
 	if params.Mode != "" {

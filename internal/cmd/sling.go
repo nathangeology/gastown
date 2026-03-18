@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
@@ -133,6 +134,7 @@ var (
 	slingRalph         bool   // --ralph: enable Ralph Wiggum loop mode for multi-step workflows
 	slingFormula       string // --formula: override formula for dispatch (default: mol-polecat-work)
 	slingCrew          string // --crew: target a crew member in the specified rig
+	slingNoWait        bool   // --no-wait: skip agent readiness wait entirely (fire-and-forget)
 )
 
 func init() {
@@ -160,6 +162,7 @@ func init() {
 	slingCmd.Flags().BoolVar(&slingRalph, "ralph", false, "Enable Ralph Wiggum loop mode (fresh context per step, for multi-step workflows)")
 	slingCmd.Flags().StringVar(&slingFormula, "formula", "", "Formula to apply (default: mol-polecat-work for polecat targets)")
 	slingCmd.Flags().StringVar(&slingCrew, "crew", "", "Target a crew member in the specified rig (e.g., --crew mel with target gastown → gastown/crew/mel)")
+	slingCmd.Flags().BoolVar(&slingNoWait, "no-wait", false, "Skip agent readiness wait (fire-and-forget sling)")
 
 	slingCmd.AddCommand(slingRespawnResetCmd)
 	rootCmd.AddCommand(slingCmd)
@@ -195,6 +198,8 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	if cmd != nil {
 		ctx = cmd.Context()
 	}
+	prof := NewSlingProfile()
+	defer prof.Report()
 	defer func() {
 		bead, target := "", ""
 		if len(args) > 0 {
@@ -205,6 +210,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 		}
 		telemetry.RecordSling(ctx, bead, target, retErr)
 	}()
+	prof.Begin("pre-checks")
 	// Polecats cannot sling - check early before writing anything.
 	// Check GT_ROLE first: coordinators (mayor, witness, etc.) may have a stale
 	// GT_POLECAT in their environment from spawning polecats. Only block if the
@@ -553,6 +559,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 
 	// Serialize assignment writes per bead to prevent concurrent sling races from
 	// producing conflicting assignee/metadata updates.
+	prof.Begin("sling-lock")
 	releaseSlingLock, err := tryAcquireSlingBeadLock(townRoot, beadID)
 	if err != nil {
 		return err
@@ -561,6 +568,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 
 	// Check if bead is already assigned (guard against accidental re-sling).
 	// This must happen before resolveTarget(), since rig targets can spawn/hook a new polecat as a side-effect.
+	prof.Begin("bead-info-guards")
 	info, err := getBeadInfo(beadID)
 	if err != nil {
 		return fmt.Errorf("checking bead status: %w", err)
@@ -657,6 +665,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	if len(args) > 1 {
 		target = args[1]
 	}
+	prof.Begin("resolve-target")
 	resolved, err := resolveTarget(target, ResolveTargetOptions{
 		DryRun:     slingDryRun,
 		Force:      force,
@@ -749,7 +758,11 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	}
 
 	// Auto-convoy: check if issue is already tracked by a convoy
-	// If not, create one for dashboard visibility (unless --no-convoy is set)
+	// If not, create one for dashboard visibility (unless --no-convoy is set).
+	// Convoy creation is deferred to a background goroutine since it involves
+	// 2 Dolt writes that are not on the critical path (gs-008).
+	prof.Begin("auto-convoy")
+	var convoyFut *convoyFuture
 	if !slingNoConvoy && formulaName == "" {
 		existingConvoy := isTrackedByConvoy(beadID)
 		if existingConvoy == "" {
@@ -760,20 +773,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 					fmt.Printf("Would set convoy merge strategy: %s\n", slingMerge)
 				}
 			} else {
-				convoyID, err := createAutoConvoy(beadID, info.Title, slingOwned, slingMerge, slingBaseBranch)
-				if err != nil {
-					// Log warning but don't fail - convoy is optional
-					fmt.Printf("%s Could not create auto-convoy: %v\n", style.Dim.Render("Warning:"), err)
-				} else {
-					fmt.Printf("%s Created convoy 🚚 %s\n", style.Bold.Render("→"), convoyID)
-					fmt.Printf("  Tracking: %s\n", beadID)
-					if slingOwned {
-						fmt.Printf("  Lifecycle: caller-managed (owned)\n")
-					}
-					if slingMerge != "" {
-						fmt.Printf("  Merge:    %s\n", slingMerge)
-					}
-				}
+				convoyFut = createAutoConvoyAsync(beadID, info.Title, slingOwned, slingMerge, slingBaseBranch)
 			}
 		} else {
 			fmt.Printf("%s Already tracked by convoy %s\n", style.Dim.Render("○"), existingConvoy)
@@ -801,6 +801,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	// When re-slinging with --force, burn ALL existing molecules before creating a new one.
 	// Without this, each sling creates a new wisp bonded to the bead, leaving orphaned molecules.
 	// NOTE: Uses local `force` (not `slingForce`) to respect auto-force paths (dead agent detection).
+	prof.Begin("formula-guard-burn")
 	if formulaName != "" {
 		existingMolecules := collectExistingMolecules(info)
 		if len(existingMolecules) > 0 {
@@ -829,10 +830,8 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	if slingDryRun {
 		if formulaName != "" {
 			fmt.Printf("Would instantiate formula %s:\n", formulaName)
-			fmt.Printf("  1. bd cook %s\n", formulaName)
-			fmt.Printf("  2. bd mol wisp %s --var feature=\"%s\" --var issue=\"%s\"\n", formulaName, info.Title, beadID)
-			fmt.Printf("  3. bd mol bond <wisp-root> %s\n", beadID)
-			fmt.Printf("  4. bd update <compound-root> --status=hooked --assignee=%s\n", targetAgent)
+			fmt.Printf("  1. bd mol bond %s %s --ephemeral --var feature=\"%s\" --var issue=\"%s\"\n", formulaName, beadID, info.Title, beadID)
+			fmt.Printf("  2. bd update <compound-root> --status=hooked --assignee=%s\n", targetAgent)
 		} else {
 			fmt.Printf("Would run: bd update %s --status=hooked --assignee=%s\n", beadID, targetAgent)
 		}
@@ -851,6 +850,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 
 	// Formula-on-bead mode: instantiate formula and bond to original bead
 	if formulaName != "" {
+		prof.Begin("formula-instantiate")
 		fmt.Printf("  Instantiating formula %s...\n", formulaName)
 
 		// Auto-inject rig command vars as defaults (user --var flags override)
@@ -897,10 +897,22 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 		// - Base bead left orphaned after gt done
 	}
 
-	// Hook the bead with retry and verification.
+	// Hook the bead and store attachment fields in a single bd update call.
+	// Combines hook-bead + store-fields phases into 1 read + 1 write (was 4 Dolt ops).
 	// See: https://github.com/steveyegge/gastown/issues/148
+	prof.Begin("hook-bead")
+	actor := detectActor()
 	hookDir := beads.ResolveHookDir(townRoot, beadID, hookWorkDir)
-	if err := hookBeadWithRetry(beadID, targetAgent, hookDir); err != nil {
+	fieldUpdates := beadFieldUpdates{
+		Dispatcher:       actor,
+		Args:             slingArgs,
+		Vars:             append([]string(nil), slingVars...),
+		AttachedMolecule: attachedMoleculeID,
+		AttachedFormula:  formulaName,
+		NoMerge:          slingNoMerge,
+		FormulaVars:      strings.Join(slingVars, "\n"),
+	}
+	if err := hookAndStoreFields(beadID, targetAgent, hookDir, fieldUpdates); err != nil {
 		return err
 	}
 
@@ -921,7 +933,6 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	fmt.Printf("%s Work attached to hook (status=hooked)\n", style.Bold.Render("✓"))
 
 	// Log sling event to activity feed
-	actor := detectActor()
 	_ = events.LogFeed(events.TypeSling, actor, events.SlingPayload(beadID, targetAgent))
 
 	// Update agent bead's hook_bead field (ZFC: agents track their current work)
@@ -932,27 +943,26 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 		updateAgentHookBead(targetAgent, beadID, hookWorkDir, townBeadsDir)
 	}
 
-	// Store all attachment fields in a single read-modify-write cycle.
-	// This eliminates the race condition where sequential independent updates
-	// (dispatcher, args, no_merge, attached_molecule) could overwrite each other.
-	fieldUpdates := beadFieldUpdates{
-		Dispatcher:       actor,
-		Args:             slingArgs,
-		Vars:             append([]string(nil), slingVars...),
-		AttachedMolecule: attachedMoleculeID,
-		AttachedFormula:  formulaName,
-		NoMerge:          slingNoMerge,
-		FormulaVars:      strings.Join(slingVars, "\n"),
+	if slingArgs != "" {
+		fmt.Printf("%s Args stored in bead (durable)\n", style.Bold.Render("✓"))
 	}
-	if err := storeFieldsInBead(beadID, fieldUpdates); err != nil {
-		// Warn but don't fail - polecat will still complete work
-		fmt.Printf("%s Could not store fields in bead: %v\n", style.Dim.Render("Warning:"), err)
-	} else {
-		if slingArgs != "" {
-			fmt.Printf("%s Args stored in bead (durable)\n", style.Bold.Render("✓"))
-		}
-		if slingNoMerge {
-			fmt.Printf("%s No-merge mode enabled (work stays on feature branch)\n", style.Bold.Render("✓"))
+	if slingNoMerge {
+		fmt.Printf("%s No-merge mode enabled (work stays on feature branch)\n", style.Bold.Render("✓"))
+	}
+
+	// Collect background convoy result (non-blocking if already done).
+	if convoyFut != nil {
+		if convoyID, err := convoyFut.Wait(); err != nil {
+			fmt.Printf("%s Could not create auto-convoy: %v\n", style.Dim.Render("Warning:"), err)
+		} else {
+			fmt.Printf("%s Created convoy 🚚 %s\n", style.Bold.Render("→"), convoyID)
+			fmt.Printf("  Tracking: %s\n", beadID)
+			if slingOwned {
+				fmt.Printf("  Lifecycle: caller-managed (owned)\n")
+			}
+			if slingMerge != "" {
+				fmt.Printf("  Merge:    %s\n", slingMerge)
+			}
 		}
 	}
 
@@ -970,6 +980,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	// This ensures polecat sees the molecule when gt prime runs on session start.
 	freshlySpawned := newPolecatInfo != nil
 	if freshlySpawned {
+		prof.Begin("session-start")
 		pane, err := newPolecatInfo.StartSession()
 		if err != nil {
 			// Rollback: session failed, clean up zombie artifacts (worktree, hooked bead).
@@ -985,18 +996,26 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	// Skip for freshly spawned polecats - SessionManager.Start() already sent StartupNudge.
 	// Skip for self-sling - agent is currently processing the sling command and will see
 	// the hooked work on next turn. Nudging would inject text while agent is busy.
+	prof.Begin("nudge")
 	if freshlySpawned {
 		// Fresh polecat already got StartupNudge from SessionManager.Start()
+		// Spawn async verification to nudge if agent doesn't start working (gs-9hc)
+		sessionName := getSessionFromPane(targetPane)
+		if sessionName != "" && !slingNoWait {
+			asyncVerifyAgentWorking(targetAgent, sessionName, beadID, 10*time.Second)
+		}
 	} else if isSelfSling {
 		// Self-sling: agent already knows about the work (just slung it)
 		fmt.Printf("%s Self-sling: work hooked, will process on next turn\n", style.Dim.Render("○"))
 	} else if targetPane == "" {
 		fmt.Printf("%s No pane to nudge (agent will discover work via gt prime)\n", style.Dim.Render("○"))
 	} else {
-		// Ensure agent is ready before nudging (prevents race condition where
-		// message arrives before Claude has fully started - see issue #115)
 		sessionName := getSessionFromPane(targetPane)
-		if sessionName != "" {
+		if slingNoWait {
+			// --no-wait: skip readiness check entirely, fire-and-forget
+			fmt.Printf("%s Skipping agent readiness wait (--no-wait)\n", style.Dim.Render("○"))
+		} else if sessionName != "" {
+			// Hybrid fast-sling (gs-9hc): short WaitForCommand + skip WaitForRuntimeReady
 			if err := ensureAgentReady(sessionName); err != nil {
 				// Non-fatal: warn and continue, agent will discover work via gt prime
 				fmt.Printf("%s Could not verify agent ready: %v\n", style.Dim.Render("○"), err)
@@ -1009,6 +1028,11 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 			fmt.Printf("  Agent will discover work via gt prime / bd show\n")
 		} else {
 			fmt.Printf("%s Start prompt sent\n", style.Bold.Render("▶"))
+		}
+
+		// Spawn async verification for existing sessions too (gs-9hc)
+		if sessionName != "" && !slingNoWait {
+			asyncVerifyAgentWorking(targetAgent, sessionName, beadID, 10*time.Second)
 		}
 	}
 
