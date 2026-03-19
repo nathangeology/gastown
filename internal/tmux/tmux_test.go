@@ -348,6 +348,13 @@ func TestEnsureSessionFreshWithCommand_KillsZombie(t *testing.T) {
 		t.Fatalf("NewSession: %v", err)
 	}
 
+	// Wait for the shell to be fully initialized before checking zombie status.
+	// Without this, GetPaneCommand can return a transient value during shell
+	// startup (e.g., "login"), causing IsAgentRunning to return true spuriously.
+	if err := tm.WaitForShellReady(sessionName, 2*time.Second); err != nil {
+		t.Fatalf("WaitForShellReady: %v", err)
+	}
+
 	// Verify it's a zombie
 	if tm.IsAgentRunning(sessionName) {
 		t.Skip("session unexpectedly has agent running")
