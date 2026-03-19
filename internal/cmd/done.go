@@ -1044,6 +1044,14 @@ notifyWitness:
 		}
 
 		fmt.Printf("%s Polecat transitioned to IDLE — ready for new work\n", style.Bold.Render("✓"))
+
+		// Register in idle-pool cache for zero-query fast path (gs-jig).
+		if polecatName != "" && rigName != "" {
+			rigPath := filepath.Join(townRoot, rigName)
+			if err := polecat.AppendIdlePool(rigPath, polecatName); err != nil {
+				style.PrintWarning("could not write to idle-pool: %v", err)
+			}
+		}
 	}
 
 	fmt.Println()

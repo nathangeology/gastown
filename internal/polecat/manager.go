@@ -1931,7 +1931,49 @@ func (m *Manager) List() ([]*Polecat, error) {
 // Optimized (gs-65e): pre-filters with tmux session set (one subprocess) and
 // uses a single batch Dolt query for all hooked beads, replacing the previous
 // N×(3-5) per-polecat Dolt queries with 1.
+// tryIdlePoolFastPath pops a name from .idle-pool and validates it is still
+// idle (directory exists, no live session). This is a zero-Dolt-query fast
+// path: if the cached name is stale it is silently discarded and we return
+// nil so the caller falls through to the full scan.
+func (m *Manager) tryIdlePoolFastPath() (*Polecat, error) {
+	name, err := PopIdlePool(m.rig.Path)
+	if err != nil || name == "" {
+		return nil, err
+	}
+
+	// Validate: directory must exist.
+	if !m.exists(name) {
+		return nil, nil
+	}
+
+	// Validate: no live, non-stale tmux session.
+	if running, stale := m.polecatSessionState(name); running && !stale {
+		return nil, nil
+	}
+
+	clonePath := m.clonePath(name)
+	polecatGit := git.NewGit(clonePath)
+	branchName, brErr := polecatGit.CurrentBranch()
+	if brErr != nil {
+		branchName = fmt.Sprintf("polecat/%s", name)
+	}
+
+	return &Polecat{
+		Name:      name,
+		Rig:       m.rig.Name,
+		State:     StateIdle,
+		ClonePath: clonePath,
+		Branch:    branchName,
+	}, nil
+}
+
 func (m *Manager) FindIdlePolecat() (*Polecat, error) {
+	// Fast path: check .idle-pool file cache (zero Dolt queries).
+	if p, err := m.tryIdlePoolFastPath(); err == nil && p != nil {
+		return p, nil
+	}
+
+	// Slow path: full scan with tmux + Dolt queries.
 	// Step 1: List polecat directories (filesystem only, no Dolt).
 	polecatsDir := filepath.Join(m.rig.Path, "polecats")
 	entries, err := os.ReadDir(polecatsDir)
