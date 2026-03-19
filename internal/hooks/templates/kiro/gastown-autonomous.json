@@ -1,0 +1,110 @@
+{
+  "name": "gastown",
+  "description": "Gas Town autonomous agent - auto-primes on startup, checks mail, enforces safety guards",
+  "prompt": "You are a Gas Town autonomous agent. Your role is determined by the GT_ROLE environment variable and injected by gt prime. On session start, gt prime runs automatically via the agentSpawn hook. Follow the instructions it provides. Check your hook with `gt hook` and begin work immediately if assigned. Use `gt handoff` to transfer work to a fresh session when needed.\n\nCRITICAL COMPLETION RULE (POLECATS):\nWhen your work is done (code committed, bead closed), you MUST run `gt done` as your FINAL action. This submits your branch to the merge queue so the refinery can merge it to main. Without `gt done`, your work is invisible and stuck on a feature branch forever. Do NOT just close the bead and stop — `gt done` is mandatory.\n\nCRITICAL DELEGATION RULES:\n- NEVER use kiro's built-in subagent/delegate tool to spawn sub-agents. It bypasses Gas Town tracking entirely.\n- To delegate work, use `gt sling` which creates tracked polecat workers in the rig.\n- To create work items, use `bd create` to make beads, then `gt sling <bead-id> --rig <rig>` to assign.\n- To track batched work, use `gt convoy create` to group related issues.\n- All delegation MUST go through Gas Town CLI commands (gt sling, gt convoy, bd create) so work appears in `gt feed` and is properly tracked.",
+  "tools": [
+    "read",
+    "write",
+    "shell",
+    "grep",
+    "glob",
+    "thinking",
+    "todo"
+  ],
+  "hooks": {
+    "agentSpawn": [
+      {
+        "type": "command",
+        "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && {{GT_BIN}} prime --hook && {{GT_BIN}} mail check --inject"
+      }
+    ],
+    "userPromptSubmit": [
+      {
+        "type": "command",
+        "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && {{GT_BIN}} mail check --inject"
+      }
+    ],
+    "stop": [
+      {
+        "type": "command",
+        "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && {{GT_BIN}} costs record &"
+      }
+    ],
+    "postToolUse": [
+      {
+        "type": "command",
+        "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && echo '[auto-done] bd close detected, running gt done...' && {{GT_BIN}} done 2>&1 || echo '[auto-done] gt done failed (may not be on a polecat branch)'",
+        "matcher": "shell(bd close*)"
+      }
+    ],
+    "preToolUse": [
+      {
+        "type": "command",
+        "command": "echo '❌ BLOCKED: Do not use kiro subagents. Use gt sling to delegate work through Gas Town.' && exit 2",
+        "matcher": "subagent(*)"
+      },
+      {
+        "type": "command",
+        "command": "echo '❌ BLOCKED: Do not use kiro subagents. Use gt sling to delegate work through Gas Town.' && exit 2",
+        "matcher": "delegate(*)"
+      },
+      {
+        "type": "command",
+        "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && {{GT_BIN}} tap guard pr-workflow",
+        "matcher": "shell(gh pr create*)"
+      },
+      {
+        "type": "command",
+        "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && {{GT_BIN}} tap guard pr-workflow",
+        "matcher": "shell(git checkout -b*)"
+      },
+      {
+        "type": "command",
+        "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && {{GT_BIN}} tap guard pr-workflow",
+        "matcher": "shell(git switch -c*)"
+      },
+      {
+        "type": "command",
+        "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && {{GT_BIN}} tap guard dangerous-command",
+        "matcher": "shell(rm -rf /*)"
+      },
+      {
+        "type": "command",
+        "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && {{GT_BIN}} tap guard dangerous-command",
+        "matcher": "shell(git push --force*)"
+      },
+      {
+        "type": "command",
+        "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && {{GT_BIN}} tap guard dangerous-command",
+        "matcher": "shell(git push -f*)"
+      },
+      {
+        "type": "command",
+        "command": "echo '❌ BLOCKED: Patrol formulas must use wisps, not persistent molecules.' && echo 'Use: bd mol wisp mol-*-patrol' && echo 'Not:  bd mol pour mol-*-patrol' && exit 2",
+        "matcher": "shell(*bd mol pour*patrol*)"
+      },
+      {
+        "type": "command",
+        "command": "echo '❌ BLOCKED: Patrol formulas must use wisps, not persistent molecules.' && echo 'Use: bd mol wisp mol-*-patrol' && echo 'Not:  bd mol pour mol-*-patrol' && exit 2",
+        "matcher": "shell(*bd mol pour *mol-witness*)"
+      },
+      {
+        "type": "command",
+        "command": "echo '❌ BLOCKED: Patrol formulas must use wisps, not persistent molecules.' && echo 'Use: bd mol wisp mol-*-patrol' && echo 'Not:  bd mol pour mol-*-patrol' && exit 2",
+        "matcher": "shell(*bd mol pour *mol-deacon*)"
+      },
+      {
+        "type": "command",
+        "command": "echo '❌ BLOCKED: Patrol formulas must use wisps, not persistent molecules.' && echo 'Use: bd mol wisp mol-*-patrol' && echo 'Not:  bd mol pour mol-*-patrol' && exit 2",
+        "matcher": "shell(*bd mol pour *mol-refinery*)"
+      }
+    ]
+  },
+  "allowedTools": [],
+  "resources": [],
+  "mcpServers": {},
+  "toolAliases": {},
+  "toolsSettings": {},
+  "includeMcpJson": true,
+  "model": null
+}

@@ -1,0 +1,41 @@
+{
+  "name": "gastown",
+  "description": "Gas Town interactive agent - primes on startup for crew and mayor roles",
+  "prompt": "You are a Gas Town agent. Your role is determined by the GT_ROLE environment variable and injected by gt prime. On session start, gt prime runs automatically via the agentSpawn hook. Follow the instructions it provides.",
+  "tools": [
+    "read",
+    "write",
+    "shell",
+    "grep",
+    "glob",
+    "thinking",
+    "todo"
+  ],
+  "hooks": {
+    "agentSpawn": [
+      {
+        "type": "command",
+        "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && {{GT_BIN}} prime --hook"
+      }
+    ],
+    "userPromptSubmit": [
+      {
+        "type": "command",
+        "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && {{GT_BIN}} mail check --inject"
+      }
+    ],
+    "stop": [
+      {
+        "type": "command",
+        "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && {{GT_BIN}} costs record &"
+      }
+    ]
+  },
+  "allowedTools": [],
+  "resources": [],
+  "mcpServers": {},
+  "toolAliases": {},
+  "toolsSettings": {},
+  "includeMcpJson": true,
+  "model": null
+}
