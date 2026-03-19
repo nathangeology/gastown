@@ -1135,11 +1135,11 @@ func (d *Daemon) ensureWitnessRunning(rigName string) {
 	}
 	mgr := witness.NewManager(r)
 
-	// NOTE: Hung session detection removed for witnesses (serial killer bug).
-	// Idle witnesses legitimately produce no tmux output while waiting for work.
-	// The deacon's patrol health-scan step handles stuck detection with proper
-	// context (checks for active work before declaring something stuck).
-	// See: daemon.log "is hung (no activity for 30m0s), killing for restart"
+	// Heartbeat-based stale detection (gs-qoi): tmux activity checks were removed
+	// (serial killer bug) but heartbeat files are written by gt commands. If the
+	// session exists but the heartbeat is stale, the agent is unresponsive — kill
+	// the session so Start() recreates it.
+	d.killStaleRoleSession(mgr.SessionName(), "witness", rigName)
 
 	if err := mgr.Start(false, "", nil); err != nil {
 		if err == witness.ErrAlreadyRunning {
@@ -1201,11 +1201,11 @@ func (d *Daemon) ensureRefineryRunning(rigName string) {
 	}
 	mgr := refinery.NewManager(r)
 
-	// NOTE: Hung session detection removed for refineries (serial killer bug).
-	// Idle refineries legitimately produce no tmux output while waiting for MRs.
-	// The deacon's patrol health-scan step handles stuck detection with proper
-	// context (checks for active work before declaring something stuck).
-	// See: daemon.log "is hung (no activity for 30m0s), killing for restart"
+	// Heartbeat-based stale detection (gs-qoi): tmux activity checks were removed
+	// (serial killer bug) but heartbeat files are written by gt commands. If the
+	// session exists but the heartbeat is stale, the agent is unresponsive — kill
+	// the session so Start() recreates it.
+	d.killStaleRoleSession(mgr.SessionName(), "refinery", rigName)
 
 	if err := mgr.Start(false, ""); err != nil {
 		if err == refinery.ErrAlreadyRunning {
@@ -1220,6 +1220,39 @@ func (d *Daemon) ensureRefineryRunning(rigName string) {
 	d.metrics.recordRestart(d.ctx, "refinery")
 	telemetry.RecordDaemonRestart(d.ctx, "refinery-"+rigName)
 	d.logger.Printf("Refinery session for %s started successfully", rigName)
+}
+
+// killStaleRoleSession checks if a role session (witness/refinery) has a stale
+// heartbeat and kills it if so. This replaces tmux activity-based hung detection
+// which was removed due to the serial killer bug (idle sessions legitimately
+// produce no tmux output). Heartbeats are written by gt commands on every
+// invocation, so a stale heartbeat means the agent is truly unresponsive.
+//
+// The stale threshold is the same as polecat heartbeats (3 minutes). If no
+// heartbeat file exists (pre-upgrade session), this is a no-op to avoid
+// false positives during rollout.
+func (d *Daemon) killStaleRoleSession(sessionName, role, rigName string) {
+	alive, _ := d.tmux.HasSession(sessionName)
+	if !alive {
+		return
+	}
+
+	stale, exists := polecat.IsSessionHeartbeatStale(d.config.TownRoot, sessionName)
+	if !exists {
+		// No heartbeat file — pre-upgrade session or just started. Skip to avoid
+		// false positives. The session will start writing heartbeats after this
+		// code is deployed.
+		return
+	}
+	if !stale {
+		return
+	}
+
+	d.logger.Printf("Stale %s session detected for %s (heartbeat expired), killing for restart", role, rigName)
+	if err := d.tmux.KillSessionWithProcesses(sessionName); err != nil {
+		d.logger.Printf("Error killing stale %s session %s: %v", role, sessionName, err)
+	}
+	polecat.RemoveSessionHeartbeat(d.config.TownRoot, sessionName)
 }
 
 // ensureMayorRunning ensures the Mayor is running.
