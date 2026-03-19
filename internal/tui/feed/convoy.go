@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -30,6 +31,12 @@ type Convoy struct {
 	Total     int       `json:"total"`
 	CreatedAt time.Time `json:"created_at"`
 	ClosedAt  time.Time `json:"closed_at,omitempty"`
+
+	// MQ status counts for tracked issues
+	MQQueued  int `json:"mq_queued,omitempty"`  // Open MRs waiting to be processed
+	MQActive  int `json:"mq_active,omitempty"`  // MRs currently being merged
+	MQMerged  int `json:"mq_merged,omitempty"`  // Successfully merged MRs
+	MQFailed  int `json:"mq_failed,omitempty"`  // Failed/rejected MRs
 }
 
 // ConvoyState holds all convoy data for the panel
@@ -49,6 +56,9 @@ func FetchConvoys(townRoot string) (*ConvoyState, error) {
 		LastUpdate: time.Now(),
 	}
 
+	// Build a map of issue ID -> MR status from all rigs
+	mqStatus := fetchMQStatusMap(townRoot)
+
 	// Fetch open convoys
 	openConvoys, err := listConvoys(townBeads, "open")
 	if err != nil {
@@ -59,6 +69,7 @@ func FetchConvoys(townRoot string) (*ConvoyState, error) {
 	for _, c := range openConvoys {
 		// Get detailed status for each convoy
 		convoy := enrichConvoy(townBeads, c)
+		applyMQStatus(&convoy, townBeads, mqStatus)
 		state.InProgress = append(state.InProgress, convoy)
 	}
 
@@ -68,6 +79,7 @@ func FetchConvoys(townRoot string) (*ConvoyState, error) {
 		cutoff := time.Now().Add(-24 * time.Hour)
 		for _, c := range closedConvoys {
 			convoy := enrichConvoy(townBeads, c)
+			applyMQStatus(&convoy, townBeads, mqStatus)
 			if !convoy.ClosedAt.IsZero() && convoy.ClosedAt.After(cutoff) {
 				state.Landed = append(state.Landed, convoy)
 			}
@@ -149,6 +161,127 @@ func enrichConvoy(beadsDir string, item convoyListItem) Convoy {
 	return convoy
 }
 
+// mrStatusEntry holds the status of a single MR bead.
+type mrStatusEntry struct {
+	SourceIssue string
+	Status      string // open, in_progress, closed
+	CloseReason string // merged, rejected, conflict, superseded
+}
+
+// fetchMQStatusMap queries all rigs for MR beads and returns a map of
+// source_issue ID -> MR status. This enables the convoy panel to show
+// which tracked issues have MRs in the merge queue.
+func fetchMQStatusMap(townRoot string) map[string]mrStatusEntry {
+	result := make(map[string]mrStatusEntry)
+
+	// Discover rig directories
+	entries, err := os.ReadDir(townRoot)
+	if err != nil {
+		return result
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() || entry.Name()[0] == '.' || entry.Name() == "mayor" || entry.Name() == "daemon" || entry.Name() == "deacon" || entry.Name() == "docs" {
+			continue
+		}
+
+		// Check for beads directory in the rig's refinery/rig path (where MRs live)
+		rigBeads := filepath.Join(townRoot, entry.Name(), "refinery", "rig", ".beads")
+		if _, err := os.Stat(rigBeads); err != nil {
+			// Try direct rig path
+			rigBeads = filepath.Join(townRoot, entry.Name(), ".beads")
+			if _, err := os.Stat(rigBeads); err != nil {
+				continue
+			}
+		}
+
+		// Query MR beads from this rig
+		mrs := queryMRBeads(rigBeads)
+		for _, mr := range mrs {
+			if mr.SourceIssue != "" {
+				result[mr.SourceIssue] = mr
+			}
+		}
+	}
+
+	return result
+}
+
+// queryMRBeads queries merge-request beads from a beads directory.
+// MR beads are stored as wisps (ephemeral), so we use bd sql to query
+// the wisps table directly, matching the pattern in beads.ListMergeRequests.
+func queryMRBeads(beadsDir string) []mrStatusEntry {
+	ctx, cancel := context.WithTimeout(context.Background(), constants.BdSubprocessTimeout)
+	defer cancel()
+
+	query := "SELECT w.id, w.status, w.description " +
+		"FROM wisps w " +
+		"JOIN wisp_labels l ON w.id = l.issue_id " +
+		"WHERE l.label = 'gt:merge-request'"
+
+	cmd := exec.CommandContext(ctx, "bd", "sql", "--json", query) //nolint:gosec
+	cmd.Dir = beadsDir
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	if err := cmd.Run(); err != nil {
+		return nil
+	}
+
+	var rows []struct {
+		ID          string `json:"id"`
+		Status      string `json:"status"`
+		Description string `json:"description"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &rows); err != nil {
+		return nil
+	}
+
+	var entries []mrStatusEntry
+	for _, row := range rows {
+		entry := mrStatusEntry{Status: row.Status}
+		// Parse source_issue and close_reason from description
+		for _, line := range strings.Split(row.Description, "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "source_issue:") {
+				entry.SourceIssue = strings.TrimSpace(strings.TrimPrefix(line, "source_issue:"))
+			} else if strings.HasPrefix(line, "close_reason:") {
+				entry.CloseReason = strings.TrimSpace(strings.TrimPrefix(line, "close_reason:"))
+			}
+		}
+		entries = append(entries, entry)
+	}
+
+	return entries
+}
+
+// applyMQStatus sets MQ counts on a convoy by matching tracked issues against the MR status map.
+func applyMQStatus(convoy *Convoy, beadsDir string, mqStatus map[string]mrStatusEntry) {
+	if len(mqStatus) == 0 {
+		return
+	}
+
+	tracked := getTrackedIssueStatus(beadsDir, convoy.ID)
+	for _, t := range tracked {
+		mr, ok := mqStatus[t.ID]
+		if !ok {
+			continue
+		}
+		switch mr.Status {
+		case "open":
+			convoy.MQQueued++
+		case "in_progress":
+			convoy.MQActive++
+		case "closed":
+			if mr.CloseReason == "merged" {
+				convoy.MQMerged++
+			} else {
+				convoy.MQFailed++
+			}
+		}
+	}
+}
+
 // Convoy panel styles
 var (
 	ConvoyPanelStyle = lipgloss.NewStyle().
@@ -179,6 +312,12 @@ var (
 
 	ConvoyAgeStyle = lipgloss.NewStyle().
 			Foreground(colorDim)
+
+	ConvoyMQStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("33")) // blue for MQ status
+
+	ConvoyMQActiveStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("214")) // orange for active merge
 )
 
 // renderConvoyPanel renders the convoy status panel
@@ -230,7 +369,7 @@ func (m *Model) renderConvoys() string {
 
 // renderConvoyLine renders a single convoy status line
 func renderConvoyLine(c Convoy, landed bool) string {
-	// Format: "  hq-xyz  Title       2/4 ●●○○" or "  hq-xyz  Title       ✓ 2h ago"
+	// Format: "  hq-xyz  Title       2/4 ●●○○  MQ: 1⚙ 1✓" or "  hq-xyz  Title       ✓ 2h ago"
 	id := ConvoyIDStyle.Render(c.ID)
 
 	// Truncate title if too long (rune-safe to avoid splitting multi-byte UTF-8)
@@ -251,6 +390,13 @@ func renderConvoyLine(c Convoy, landed bool) string {
 	// Show progress bar
 	progress := renderProgressBar(c.Completed, c.Total)
 	count := ConvoyProgressStyle.Render(fmt.Sprintf("%d/%d", c.Completed, c.Total))
+
+	// Show MQ status if any MRs exist
+	mqInfo := renderMQStatus(c)
+
+	if mqInfo != "" {
+		return fmt.Sprintf("  %s  %-20s  %s %s  %s", id, title, count, progress, mqInfo)
+	}
 	return fmt.Sprintf("  %s  %-20s  %s %s", id, title, count, progress)
 }
 
@@ -273,4 +419,29 @@ func renderProgressBar(completed, total int) string {
 
 	bar := strings.Repeat("●", filled) + strings.Repeat("○", displayTotal-filled)
 	return ConvoyProgressStyle.Render(bar)
+}
+
+// renderMQStatus renders a compact MQ status string for a convoy.
+// Shows counts of MRs in various states: ⚙ queued, ⏳ active, ✓ merged, ✗ failed.
+func renderMQStatus(c Convoy) string {
+	total := c.MQQueued + c.MQActive + c.MQMerged + c.MQFailed
+	if total == 0 {
+		return ""
+	}
+
+	var parts []string
+	if c.MQActive > 0 {
+		parts = append(parts, ConvoyMQActiveStyle.Render(fmt.Sprintf("⚙%d", c.MQActive)))
+	}
+	if c.MQQueued > 0 {
+		parts = append(parts, ConvoyMQStyle.Render(fmt.Sprintf("⏳%d", c.MQQueued)))
+	}
+	if c.MQMerged > 0 {
+		parts = append(parts, ConvoyLandedStyle.Render(fmt.Sprintf("✓%d", c.MQMerged)))
+	}
+	if c.MQFailed > 0 {
+		parts = append(parts, EventFailStyle.Render(fmt.Sprintf("✗%d", c.MQFailed)))
+	}
+
+	return ConvoyMQStyle.Render("MQ:") + " " + strings.Join(parts, " ")
 }
