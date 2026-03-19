@@ -308,6 +308,11 @@ type Beads struct {
 	// Populated on first call to getTownRoot() to avoid filesystem walk on every operation.
 	townRoot     string
 	townRootOnce sync.Once
+
+	// Direct SQL client (lazy-initialized when GT_DIRECT_BEADS=1).
+	direct     *DirectClient
+	directOnce sync.Once
+	directErr  error
 }
 
 // New creates a new Beads wrapper for the given directory.
@@ -364,6 +369,18 @@ func (b *Beads) getResolvedBeadsDir() string {
 		return b.beadsDir
 	}
 	return ResolveBeadsDir(b.workDir)
+}
+
+// getDirectClient returns the DirectClient for this Beads instance, lazily initializing it.
+// Returns nil if GT_DIRECT_BEADS is not enabled, if in isolated mode, or if connection fails.
+func (b *Beads) getDirectClient() *DirectClient {
+	if b.isolated || !DirectEnabled() {
+		return nil
+	}
+	b.directOnce.Do(func() {
+		b.direct, b.directErr = NewDirectClient(b.getResolvedBeadsDir())
+	})
+	return b.direct
 }
 
 // Init initializes a new beads database in the working directory.
@@ -648,6 +665,15 @@ func stripEnvPrefixes(environ []string, prefixes ...string) []string {
 // wisps table (where ephemeral issues live in beads v0.59+). Without this,
 // "bd list" only searches the issues table and misses wisps entirely.
 func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
+	// Direct SQL fast path (GT_DIRECT_BEADS=1)
+	if dc := b.getDirectClient(); dc != nil && opts.Parent == "" {
+		issues, err := dc.List(opts)
+		if err == nil {
+			return issues, nil
+		}
+		// Fall through to subprocess on error
+	}
+
 	if opts.Ephemeral {
 		return b.listEphemeral(opts)
 	}
@@ -975,6 +1001,15 @@ func (b *Beads) Show(id string) (*Issue, error) {
 		return target.Show(id)
 	}
 
+	// Direct SQL fast path (GT_DIRECT_BEADS=1)
+	if dc := b.getDirectClient(); dc != nil {
+		issue, err := dc.Show(id)
+		if err == nil {
+			return issue, nil
+		}
+		// Fall through to subprocess on error
+	}
+
 	out, err := b.run("show", id, "--json")
 	if err != nil {
 		return nil, err
@@ -1072,6 +1107,19 @@ func (b *Beads) Create(opts CreateOptions) (*Issue, error) {
 	// Guard against flag-like titles (gt-e0kx5: --help garbage beads)
 	if IsFlagLikeTitle(opts.Title) {
 		return nil, fmt.Errorf("refusing to create bead: %w (got %q)", ErrFlagTitle, opts.Title)
+	}
+
+	// Direct SQL fast path (GT_DIRECT_BEADS=1)
+	if dc := b.getDirectClient(); dc != nil {
+		// Default Actor from BD_ACTOR env var if not specified
+		if opts.Actor == "" {
+			opts.Actor = b.getActor()
+		}
+		issue, err := dc.Create(opts)
+		if err == nil {
+			return issue, nil
+		}
+		// Fall through to subprocess on error
 	}
 
 	args := []string{"create", "--json"}
@@ -1290,6 +1338,14 @@ func normalizeBugTitle(title string) string {
 
 // Update updates an existing issue.
 func (b *Beads) Update(id string, opts UpdateOptions) error {
+	// Direct SQL fast path (GT_DIRECT_BEADS=1)
+	if dc := b.getDirectClient(); dc != nil {
+		if err := dc.Update(id, opts); err == nil {
+			return nil
+		}
+		// Fall through to subprocess on error
+	}
+
 	args := []string{"update", id}
 
 	if opts.Title != nil {
