@@ -1914,6 +1914,11 @@ func runConvoyStatus(cmd *cobra.Command, args []string) error {
 				}
 				line += fmt.Sprintf("  %s", style.Dim.Render(workerDisplay))
 			}
+			if t.LastActivity != "" {
+				if ts, err := time.Parse(time.RFC3339, t.LastActivity); err == nil {
+					line += fmt.Sprintf("  %s", style.Dim.Render(formatWorkerAge(time.Since(ts))+" ago"))
+				}
+			}
 			fmt.Println(line)
 		}
 	}
@@ -2174,16 +2179,17 @@ func formatConvoyStatus(status string) string {
 
 // trackedIssueInfo holds info about an issue being tracked by a convoy.
 type trackedIssueInfo struct {
-	ID        string `json:"id"`
-	Title     string `json:"title"`
-	Status    string `json:"status"`
-	Type      string `json:"dependency_type"`
-	IssueType string `json:"issue_type"`
-	Blocked   bool     `json:"blocked,omitempty"`    // True if issue currently has blockers
-	Assignee  string   `json:"assignee,omitempty"`   // Assigned agent (e.g., gastown/polecats/goose)
-	Labels    []string `json:"labels,omitempty"`     // Bead labels (propagated from trackedDependency)
-	Worker    string   `json:"worker,omitempty"`     // Worker currently assigned (e.g., gastown/nux)
-	WorkerAge string   `json:"worker_age,omitempty"` // How long worker has been on this issue
+	ID           string   `json:"id"`
+	Title        string   `json:"title"`
+	Status       string   `json:"status"`
+	Type         string   `json:"dependency_type"`
+	IssueType    string   `json:"issue_type"`
+	Blocked      bool     `json:"blocked,omitempty"`       // True if issue currently has blockers
+	Assignee     string   `json:"assignee,omitempty"`      // Assigned agent (e.g., gastown/polecats/goose)
+	Labels       []string `json:"labels,omitempty"`        // Bead labels (propagated from trackedDependency)
+	Worker       string   `json:"worker,omitempty"`        // Worker currently assigned (e.g., gastown/nux)
+	WorkerAge    string   `json:"worker_age,omitempty"`    // How long worker has been on this issue
+	LastActivity string   `json:"last_activity,omitempty"` // Last update timestamp (RFC3339)
 }
 
 // trackedDependency is dep-list data enriched with fresh issue details.
@@ -2196,11 +2202,13 @@ type trackedDependency struct {
 	DependencyType string   `json:"dependency_type"`
 	Labels         []string `json:"labels"`
 	Blocked        bool     `json:"-"`
+	UpdatedAt      string   `json:"-"`
 }
 
 func applyFreshIssueDetails(dep *trackedDependency, details *issueDetails) {
 	dep.Status = details.Status
 	dep.Blocked = details.IsBlocked()
+	dep.UpdatedAt = details.UpdatedAt
 	if dep.Title == "" {
 		dep.Title = details.Title
 	}
@@ -2282,14 +2290,15 @@ func getTrackedIssues(townBeads, convoyID string) ([]trackedIssueInfo, error) {
 	var tracked []trackedIssueInfo
 	for _, dep := range deps {
 		info := trackedIssueInfo{
-			ID:        dep.ID,
-			Title:     dep.Title,
-			Status:    dep.Status,
-			Type:      dep.DependencyType,
-			IssueType: dep.IssueType,
-			Blocked:   dep.Blocked,
-			Assignee:  dep.Assignee,
-			Labels:    dep.Labels,
+			ID:           dep.ID,
+			Title:        dep.Title,
+			Status:       dep.Status,
+			Type:         dep.DependencyType,
+			IssueType:    dep.IssueType,
+			Blocked:      dep.Blocked,
+			Assignee:     dep.Assignee,
+			Labels:       dep.Labels,
+			LastActivity: dep.UpdatedAt,
 		}
 
 		// Add worker info if available
@@ -2384,6 +2393,7 @@ type issueDetailsJSON struct {
 	BlockedBy      []string          `json:"blocked_by"`
 	BlockedByCount int               `json:"blocked_by_count"`
 	Dependencies   []issueDependency `json:"dependencies"`
+	UpdatedAt      string            `json:"updated_at"`
 }
 
 func (issue issueDetailsJSON) toIssueDetails() *issueDetails {
@@ -2397,6 +2407,7 @@ func (issue issueDetailsJSON) toIssueDetails() *issueDetails {
 		BlockedBy:      issue.BlockedBy,
 		BlockedByCount: issue.BlockedByCount,
 		Dependencies:   issue.Dependencies,
+		UpdatedAt:      issue.UpdatedAt,
 	}
 }
 
@@ -2449,6 +2460,7 @@ type issueDetails struct {
 	BlockedBy      []string
 	BlockedByCount int
 	Dependencies   []issueDependency
+	UpdatedAt      string
 }
 
 func (d issueDetails) IsBlocked() bool {

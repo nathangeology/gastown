@@ -1,7 +1,9 @@
 package cmd
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -12,7 +14,10 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/doltserver"
+	"github.com/steveyegge/gastown/internal/events"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -30,12 +35,166 @@ func runVitals(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
+	printVitalsAgents(townRoot)
+	fmt.Println()
 	printVitalsDoltServers(townRoot)
 	fmt.Println()
 	printVitalsDatabases(townRoot)
 	fmt.Println()
 	printVitalsBackups(townRoot)
 	return nil
+}
+
+func printVitalsAgents(townRoot string) {
+	fmt.Println(style.Bold.Render("Agents"))
+
+	// Count active sessions by role
+	counts := vitalsCountSessionsByRole()
+	roles := []session.Role{session.RolePolecat, session.RoleCrew, session.RoleWitness, session.RoleRefinery}
+	var parts []string
+	for _, r := range roles {
+		if n := counts[r]; n > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", n, r))
+		}
+	}
+	if len(parts) == 0 {
+		fmt.Printf("  Sessions: %s\n", style.Dim.Render("none"))
+	} else {
+		fmt.Printf("  Sessions: %s\n", strings.Join(parts, ", "))
+	}
+
+	// Recent errors/escalations from .events.jsonl
+	errs1h, errs24h, escs1h, escs24h := vitalsCountRecentEvents(townRoot)
+	fmt.Printf("  Errors:   %s (1h)  %s (24h)\n",
+		vitalsColorCount(errs1h), vitalsColorCount(errs24h))
+	fmt.Printf("  Escalate: %s (1h)  %s (24h)\n",
+		vitalsColorCount(escs1h), vitalsColorCount(escs24h))
+
+	// Throughput: beads closed
+	closed1h, closed24h := vitalsCountBeadsClosed(townRoot)
+	fmt.Printf("  Closed:   %d (1h)  %d (24h)\n", closed1h, closed24h)
+}
+
+func vitalsColorCount(n int) string {
+	s := strconv.Itoa(n)
+	if n > 0 {
+		return style.Warning.Render(s)
+	}
+	return s
+}
+
+// vitalsCountSessionsByRole lists tmux sessions and counts them by role.
+func vitalsCountSessionsByRole() map[session.Role]int {
+	counts := make(map[session.Role]int)
+	listCmd := tmux.BuildCommand("list-sessions", "-F", "#{session_name}")
+	out, err := listCmd.Output()
+	if err != nil {
+		return counts
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		id, err := session.ParseSessionName(line)
+		if err != nil {
+			continue
+		}
+		counts[id.Role]++
+	}
+	return counts
+}
+
+// vitalsCountRecentEvents scans .events.jsonl for errors and escalations in the last 1h and 24h.
+func vitalsCountRecentEvents(townRoot string) (errs1h, errs24h, escs1h, escs24h int) {
+	eventsPath := filepath.Join(townRoot, events.EventsFile)
+	f, err := os.Open(eventsPath)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	now := time.Now().UTC()
+	cutoff1h := now.Add(-1 * time.Hour)
+	cutoff24h := now.Add(-24 * time.Hour)
+
+	// Seek near end of file for efficiency — events older than 24h are irrelevant
+	if info, err := f.Stat(); err == nil && info.Size() > 256*1024 {
+		f.Seek(-256*1024, 2) //nolint:errcheck // best-effort seek
+	}
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		var ev struct {
+			Timestamp string `json:"ts"`
+			Type      string `json:"type"`
+		}
+		if json.Unmarshal(line, &ev) != nil {
+			continue
+		}
+		ts, err := time.Parse(time.RFC3339, ev.Timestamp)
+		if err != nil || ts.Before(cutoff24h) {
+			continue
+		}
+		switch ev.Type {
+		case events.TypeSessionDeath, events.TypeMassDeath, events.TypeMergeFailed:
+			errs24h++
+			if ts.After(cutoff1h) {
+				errs1h++
+			}
+		case events.TypeEscalationSent:
+			escs24h++
+			if ts.After(cutoff1h) {
+				escs1h++
+			}
+		}
+	}
+	return
+}
+
+// vitalsCountBeadsClosed counts beads closed in the last 1h and 24h via Dolt query.
+func vitalsCountBeadsClosed(townRoot string) (closed1h, closed24h int) {
+	config := doltserver.DefaultConfig(townRoot)
+	databases, _ := doltserver.ListDatabases(townRoot)
+	now := time.Now().UTC()
+	t1h := now.Add(-1 * time.Hour).Format("2006-01-02 15:04:05")
+	t24h := now.Add(-24 * time.Hour).Format("2006-01-02 15:04:05")
+
+	for _, db := range databases {
+		c1, c24 := vitalsQueryClosed(config, db, t1h, t24h)
+		closed1h += c1
+		closed24h += c24
+	}
+	return
+}
+
+func vitalsQueryClosed(config *doltserver.Config, dbName, t1h, t24h string) (int, int) {
+	q := fmt.Sprintf(
+		"SELECT "+
+			"SUM(CASE WHEN updated_at >= '%s' THEN 1 ELSE 0 END),"+
+			"SUM(CASE WHEN updated_at >= '%s' THEN 1 ELSE 0 END) "+
+			"FROM %s.issues WHERE status='closed'", t1h, t24h, dbName)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "dolt",
+		"--host", "127.0.0.1", "--port", strconv.Itoa(config.Port),
+		"--user", config.User, "--no-tls", "sql", "-r", "csv", "-q", q)
+	cmd.Env = append(os.Environ(), "DOLT_CLI_PASSWORD="+config.Password)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, 0
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) < 2 {
+		return 0, 0
+	}
+	f := strings.Split(lines[1], ",")
+	if len(f) < 2 {
+		return 0, 0
+	}
+	c1, _ := strconv.Atoi(strings.TrimSpace(f[0]))
+	c24, _ := strconv.Atoi(strings.TrimSpace(f[1]))
+	return c1, c24
 }
 
 func printVitalsDoltServers(townRoot string) {

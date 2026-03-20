@@ -953,7 +953,20 @@ func outputStatusJSON(status TownStatus) error {
 	return enc.Encode(status)
 }
 
+// hookTruncLen computes the max length for hook titles given terminal width
+// and the fixed-width columns that precede the hook text on a compact line.
+// Layout: {indent}{name:<12} {indicator}{agentInfo} → {title}{mail}
+// We reserve ~30 chars for the fixed parts and give the rest to the title.
+func hookTruncLen(termWidth, extraReserve int) int {
+	available := termWidth - 30 - extraReserve // 30 = indent(3)+name(12)+indicator(5)+arrow(4)+padding(6)
+	if available < 10 {
+		return 10
+	}
+	return available
+}
+
 func outputStatusText(w io.Writer, status TownStatus) error {
+	termWidth := getTerminalWidth()
 	// Header
 	fmt.Fprintf(w, "%s %s\n", style.Bold.Render("Town:"), status.Name)
 	fmt.Fprintf(w, "%s\n\n", style.Dim.Render(status.Location))
@@ -1055,11 +1068,11 @@ func outputStatusText(w io.Writer, status TownStatus) error {
 		}
 		if statusVerbose {
 			fmt.Fprintf(w, "%s %s\n", icon, style.Bold.Render(capitalizeFirst(agent.Name)))
-			renderAgentDetails(w, agent, "   ", nil, status.Location)
+			renderAgentDetails(w, agent, "   ", nil, status.Location, termWidth)
 			fmt.Fprintln(w)
 		} else {
 			// Compact: icon + name on one line
-			renderAgentCompact(w, agent, icon+" ", nil, status.Location)
+			renderAgentCompact(w, agent, icon+" ", nil, status.Location, termWidth)
 		}
 	}
 	if !statusVerbose && len(status.Agents) > 0 {
@@ -1096,12 +1109,12 @@ func outputStatusText(w io.Writer, status TownStatus) error {
 			if statusVerbose {
 				fmt.Fprintf(w, "%s %s\n", roleIcons[constants.RoleWitness], style.Bold.Render("Witness"))
 				for _, agent := range witnesses {
-					renderAgentDetails(w, agent, "   ", r.Hooks, status.Location)
+					renderAgentDetails(w, agent, "   ", r.Hooks, status.Location, termWidth)
 				}
 				fmt.Fprintln(w)
 			} else {
 				for _, agent := range witnesses {
-					renderAgentCompact(w, agent, roleIcons[constants.RoleWitness]+" ", r.Hooks, status.Location)
+					renderAgentCompact(w, agent, roleIcons[constants.RoleWitness]+" ", r.Hooks, status.Location, termWidth)
 				}
 			}
 		}
@@ -1111,7 +1124,7 @@ func outputStatusText(w io.Writer, status TownStatus) error {
 			if statusVerbose {
 				fmt.Fprintf(w, "%s %s\n", roleIcons[constants.RoleRefinery], style.Bold.Render("Refinery"))
 				for _, agent := range refineries {
-					renderAgentDetails(w, agent, "   ", r.Hooks, status.Location)
+					renderAgentDetails(w, agent, "   ", r.Hooks, status.Location, termWidth)
 				}
 				// MQ summary (shown under refinery)
 				if r.MQ != nil {
@@ -1131,7 +1144,7 @@ func outputStatusText(w io.Writer, status TownStatus) error {
 							mqSuffix = "  " + mqStr
 						}
 					}
-					renderAgentCompactWithSuffix(w, agent, roleIcons[constants.RoleRefinery]+" ", r.Hooks, status.Location, mqSuffix)
+					renderAgentCompactWithSuffix(w, agent, roleIcons[constants.RoleRefinery]+" ", r.Hooks, status.Location, mqSuffix, termWidth)
 				}
 			}
 		}
@@ -1141,13 +1154,13 @@ func outputStatusText(w io.Writer, status TownStatus) error {
 			if statusVerbose {
 				fmt.Fprintf(w, "%s %s (%d)\n", roleIcons[constants.RoleCrew], style.Bold.Render("Crew"), len(crews))
 				for _, agent := range crews {
-					renderAgentDetails(w, agent, "   ", r.Hooks, status.Location)
+					renderAgentDetails(w, agent, "   ", r.Hooks, status.Location, termWidth)
 				}
 				fmt.Fprintln(w)
 			} else {
 				fmt.Fprintf(w, "%s %s (%d)\n", roleIcons[constants.RoleCrew], style.Bold.Render("Crew"), len(crews))
 				for _, agent := range crews {
-					renderAgentCompact(w, agent, "   ", r.Hooks, status.Location)
+					renderAgentCompact(w, agent, "   ", r.Hooks, status.Location, termWidth)
 				}
 			}
 		}
@@ -1157,13 +1170,13 @@ func outputStatusText(w io.Writer, status TownStatus) error {
 			if statusVerbose {
 				fmt.Fprintf(w, "%s %s (%d)\n", roleIcons[constants.RolePolecat], style.Bold.Render("Polecats"), len(polecats))
 				for _, agent := range polecats {
-					renderAgentDetails(w, agent, "   ", r.Hooks, status.Location)
+					renderAgentDetails(w, agent, "   ", r.Hooks, status.Location, termWidth)
 				}
 				fmt.Fprintln(w)
 			} else {
 				fmt.Fprintf(w, "%s %s (%d)\n", roleIcons[constants.RolePolecat], style.Bold.Render("Polecats"), len(polecats))
 				for _, agent := range polecats {
-					renderAgentCompact(w, agent, "   ", r.Hooks, status.Location)
+					renderAgentCompact(w, agent, "   ", r.Hooks, status.Location, termWidth)
 				}
 			}
 		}
@@ -1179,7 +1192,7 @@ func outputStatusText(w io.Writer, status TownStatus) error {
 }
 
 // renderAgentDetails renders full agent bead details
-func renderAgentDetails(w io.Writer, agent AgentRuntime, indent string, hooks []AgentHookInfo, townRoot string) { //nolint:unparam // indent kept for future customization
+func renderAgentDetails(w io.Writer, agent AgentRuntime, indent string, hooks []AgentHookInfo, townRoot string, termWidth int) { //nolint:unparam // indent kept for future customization
 	// Line 1: Agent bead ID + status
 	// Per gt-zecmc: derive status from tmux (observable reality), not bead state.
 	// "Discover, don't track" - agent liveness is observable from tmux session.
@@ -1259,15 +1272,21 @@ func renderAgentDetails(w io.Writer, agent AgentRuntime, indent string, hooks []
 		}
 	}
 
+	// Compute dynamic truncation for verbose mode (indent + "  hook: " = ~10 chars overhead)
+	verboseTitleMax := termWidth - len(indent) - 10
+	if verboseTitleMax < 20 {
+		verboseTitleMax = 20
+	}
+
 	if hookBead != "" {
 		if hookTitle != "" {
-			hookStr = fmt.Sprintf("%s → %s", hookBead, truncateWithEllipsis(hookTitle, 40))
+			hookStr = fmt.Sprintf("%s → %s", hookBead, truncateWithEllipsis(hookTitle, verboseTitleMax-len(hookBead)-4))
 		} else {
 			hookStr = hookBead
 		}
 	} else if hookTitle != "" {
 		// Has title but no molecule ID
-		hookStr = truncateWithEllipsis(hookTitle, 50)
+		hookStr = truncateWithEllipsis(hookTitle, verboseTitleMax)
 	}
 
 	fmt.Fprintf(w, "%s  hook: %s\n", indent, hookStr)
@@ -1281,7 +1300,11 @@ func renderAgentDetails(w io.Writer, agent AgentRuntime, indent string, hooks []
 	if agent.UnreadMail > 0 {
 		mailStr := fmt.Sprintf("📬 %d unread", agent.UnreadMail)
 		if agent.FirstSubject != "" {
-			mailStr = fmt.Sprintf("📬 %d unread → %s", agent.UnreadMail, truncateWithEllipsis(agent.FirstSubject, 35))
+			mailMax := verboseTitleMax - 15 // "📬 N unread → " overhead
+			if mailMax < 10 {
+				mailMax = 10
+			}
+			mailStr = fmt.Sprintf("📬 %d unread → %s", agent.UnreadMail, truncateWithEllipsis(agent.FirstSubject, mailMax))
 		}
 		fmt.Fprintf(w, "%s  mail: %s\n", indent, mailStr)
 	}
@@ -1339,7 +1362,7 @@ func formatMQSummaryCompact(mq *MQSummary) string {
 }
 
 // renderAgentCompactWithSuffix renders a single-line agent status with an extra suffix
-func renderAgentCompactWithSuffix(w io.Writer, agent AgentRuntime, indent string, hooks []AgentHookInfo, _ string, suffix string) {
+func renderAgentCompactWithSuffix(w io.Writer, agent AgentRuntime, indent string, hooks []AgentHookInfo, _ string, suffix string, termWidth int) {
 	// Build status indicator (gt-zecmc: use tmux state, not bead state)
 	statusIndicator := buildStatusIndicator(agent)
 
@@ -1356,16 +1379,24 @@ func renderAgentCompactWithSuffix(w io.Writer, agent AgentRuntime, indent string
 		}
 	}
 
-	// Build hook suffix
+	// Build hook suffix with dynamic truncation based on terminal width
 	hookSuffix := ""
+	extraReserve := len(suffix)
+	if agent.UnreadMail > 0 {
+		extraReserve += 5
+	}
+	if agent.AgentInfo != "" {
+		extraReserve += len(agent.AgentInfo) + 3
+	}
+	titleMax := hookTruncLen(termWidth, extraReserve)
 	if hookBead != "" {
 		if hookTitle != "" {
-			hookSuffix = style.Dim.Render(" → ") + truncateWithEllipsis(hookTitle, 30)
+			hookSuffix = style.Dim.Render(" → ") + truncateWithEllipsis(hookTitle, titleMax)
 		} else {
 			hookSuffix = style.Dim.Render(" → ") + hookBead
 		}
 	} else if hookTitle != "" {
-		hookSuffix = style.Dim.Render(" → ") + truncateWithEllipsis(hookTitle, 30)
+		hookSuffix = style.Dim.Render(" → ") + truncateWithEllipsis(hookTitle, titleMax)
 	}
 
 	// Mail indicator
@@ -1385,7 +1416,7 @@ func renderAgentCompactWithSuffix(w io.Writer, agent AgentRuntime, indent string
 }
 
 // renderAgentCompact renders a single-line agent status
-func renderAgentCompact(w io.Writer, agent AgentRuntime, indent string, hooks []AgentHookInfo, _ string) {
+func renderAgentCompact(w io.Writer, agent AgentRuntime, indent string, hooks []AgentHookInfo, _ string, termWidth int) {
 	// Build status indicator (gt-zecmc: use tmux state, not bead state)
 	statusIndicator := buildStatusIndicator(agent)
 
@@ -1402,16 +1433,24 @@ func renderAgentCompact(w io.Writer, agent AgentRuntime, indent string, hooks []
 		}
 	}
 
-	// Build hook suffix
+	// Build hook suffix with dynamic truncation based on terminal width
 	hookSuffix := ""
+	extraReserve := 0
+	if agent.UnreadMail > 0 {
+		extraReserve += 5
+	}
+	if agent.AgentInfo != "" {
+		extraReserve += len(agent.AgentInfo) + 3
+	}
+	titleMax := hookTruncLen(termWidth, extraReserve)
 	if hookBead != "" {
 		if hookTitle != "" {
-			hookSuffix = style.Dim.Render(" → ") + truncateWithEllipsis(hookTitle, 30)
+			hookSuffix = style.Dim.Render(" → ") + truncateWithEllipsis(hookTitle, titleMax)
 		} else {
 			hookSuffix = style.Dim.Render(" → ") + hookBead
 		}
 	} else if hookTitle != "" {
-		hookSuffix = style.Dim.Render(" → ") + truncateWithEllipsis(hookTitle, 30)
+		hookSuffix = style.Dim.Render(" → ") + truncateWithEllipsis(hookTitle, titleMax)
 	}
 
 	// Mail indicator
@@ -1480,15 +1519,23 @@ func formatHookInfo(hookBead, title string, maxLen int) string {
 	return fmt.Sprintf(" → %s", title)
 }
 
-// truncateWithEllipsis shortens a string to maxLen, adding "..." if truncated
+// truncateWithEllipsis shortens a string to maxLen, adding "…" if truncated.
 func truncateWithEllipsis(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
 	}
-	if maxLen < 4 {
+	if maxLen < 2 {
 		return s[:maxLen]
 	}
-	return s[:maxLen-3] + "..."
+	return s[:maxLen-1] + "…"
+}
+
+// getTerminalWidth returns the current terminal width, defaulting to 80.
+func getTerminalWidth() int {
+	if w, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && w > 0 {
+		return w
+	}
+	return 80
 }
 
 // capitalizeFirst capitalizes the first letter of a string

@@ -71,8 +71,11 @@ func createConflictingBranch(t *testing.T, workDir, branchName, filename, conten
 
 func run(t *testing.T, dir string, name string, args ...string) string {
 	t.Helper()
-	cmd := exec.Command(name, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("command %s %v failed: %v\n%s", name, args, err, out)

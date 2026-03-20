@@ -29,11 +29,18 @@ var (
 	dockerAvail  bool
 )
 
-// isDockerAvailable returns true if the Docker daemon is reachable.
+// isDockerAvailable returns true if the Docker daemon is reachable and the
+// default bridge network exists (required by testcontainers).
 // The result is cached after the first call.
 func isDockerAvailable() bool {
 	dockerOnce.Do(func() {
-		dockerAvail = exec.Command("docker", "info").Run() == nil
+		if exec.Command("docker", "info").Run() != nil {
+			return
+		}
+		if exec.Command("docker", "network", "inspect", "bridge").Run() != nil {
+			return
+		}
+		dockerAvail = true
 	})
 	return dockerAvail
 }

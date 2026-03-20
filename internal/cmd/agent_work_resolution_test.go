@@ -138,7 +138,7 @@ func TestFindBranchRecoveredWork_UsesPolecatBranchIssue(t *testing.T) {
 	addCommit := [][]string{
 		{"git", "add", "README.md"},
 		{"git", "commit", "-m", "init"},
-		{"git", "checkout", "-b", "main"},
+		{"git", "branch", "-M", "main"},
 		{"git", "checkout", "-b", "polecat/dementus/gs-hxk@abc123"},
 	}
 	for _, args := range addCommit {

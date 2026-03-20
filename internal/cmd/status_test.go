@@ -89,7 +89,7 @@ func TestRenderAgentDetails_UsesRigPrefix(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	renderAgentDetails(&buf, agent, "", nil, townRoot)
+	renderAgentDetails(&buf, agent, "", nil, townRoot, 120)
 	output := buf.String()
 
 	if !strings.Contains(output, "bd-beads-witness") {

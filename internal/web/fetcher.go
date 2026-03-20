@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/activity"
@@ -734,6 +735,15 @@ func (f *LiveConvoyFetcher) FetchWorkers() ([]WorkerRow, error) {
 	// Pre-fetch merge queue count to determine refinery idle status
 	mergeQueueCount := f.getMergeQueueCount()
 
+	// First pass: collect worker sessions to batch status hint fetching
+	type workerInfo struct {
+		sessionName  string
+		identity     *session.AgentIdentity
+		activityTime time.Time
+		activityAge  time.Duration
+	}
+	var workerInfos []workerInfo
+
 	var workers []WorkerRow
 	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
 
@@ -769,27 +779,45 @@ func (f *LiveConvoyFetcher) FetchWorkers() ([]WorkerRow, error) {
 			continue
 		}
 
-		// Determine agent type and worker name
-		workerName := identity.Name
-		agentType := constants.RolePolecat // Default for ephemeral sessions (polecats, crew)
-		if identity.Role == session.RoleRefinery {
-			agentType = constants.RoleRefinery
-		}
-
 		// Parse activity timestamp
 		var activityUnix int64
 		if _, err := fmt.Sscanf(parts[1], "%d", &activityUnix); err != nil || activityUnix == 0 {
 			continue
 		}
 		activityTime := time.Unix(activityUnix, 0)
-		activityAge := time.Since(activityTime)
+
+		workerInfos = append(workerInfos, workerInfo{
+			sessionName:  sessionName,
+			identity:     identity,
+			activityTime: activityTime,
+			activityAge:  time.Since(activityTime),
+		})
+	}
+
+	// Batch fetch status hints for all non-refinery workers in parallel (capped concurrency)
+	var hintSessionNames []string
+	for _, wi := range workerInfos {
+		if wi.identity.Name != "refinery" {
+			hintSessionNames = append(hintSessionNames, wi.sessionName)
+		}
+	}
+	statusHints := f.batchGetWorkerStatusHints(hintSessionNames)
+
+	// Second pass: build worker rows using pre-fetched data
+	for _, wi := range workerInfos {
+		workerName := wi.identity.Name
+		rig := wi.identity.Rig
+		agentType := constants.RolePolecat // Default for ephemeral sessions (polecats, crew)
+		if wi.identity.Role == session.RoleRefinery {
+			agentType = constants.RoleRefinery
+		}
 
 		// Get status hint - special handling for refinery
 		var statusHint string
 		if workerName == "refinery" {
 			statusHint = f.getRefineryStatusHint(mergeQueueCount)
 		} else {
-			statusHint = f.getWorkerStatusHint(sessionName)
+			statusHint = statusHints[wi.sessionName]
 		}
 
 		// Look up assigned issue for this worker
@@ -803,13 +831,13 @@ func (f *LiveConvoyFetcher) FetchWorkers() ([]WorkerRow, error) {
 		}
 
 		// Calculate work status based on activity age and issue assignment
-		workStatus := calculateWorkerWorkStatus(activityAge, issueID, workerName, f.staleThreshold, f.stuckThreshold)
+		workStatus := calculateWorkerWorkStatus(wi.activityAge, issueID, workerName, f.staleThreshold, f.stuckThreshold)
 
 		workers = append(workers, WorkerRow{
 			Name:         workerName,
 			Rig:          rig,
-			SessionID:    sessionName,
-			LastActivity: activity.Calculate(activityTime),
+			SessionID:    wi.sessionName,
+			LastActivity: activity.Calculate(wi.activityTime),
 			StatusHint:   statusHint,
 			IssueID:      issueID,
 			IssueTitle:   issueTitle,
@@ -905,6 +933,40 @@ func (f *LiveConvoyFetcher) getWorkerStatusHint(sessionName string) string {
 		}
 	}
 	return ""
+}
+
+// batchGetWorkerStatusHints fetches status hints for multiple sessions concurrently
+// with capped parallelism to avoid overwhelming tmux.
+func (f *LiveConvoyFetcher) batchGetWorkerStatusHints(sessionNames []string) map[string]string {
+	if len(sessionNames) == 0 {
+		return nil
+	}
+
+	result := make(map[string]string, len(sessionNames))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	// Cap concurrency at 4 to avoid tmux contention
+	sem := make(chan struct{}, 4)
+
+	for _, name := range sessionNames {
+		wg.Add(1)
+		go func(sn string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			hint := f.getWorkerStatusHint(sn)
+			if hint != "" {
+				mu.Lock()
+				result[sn] = hint
+				mu.Unlock()
+			}
+		}(name)
+	}
+	wg.Wait()
+
+	return result
 }
 
 // getMergeQueueCount returns the total number of open PRs across all repos.
