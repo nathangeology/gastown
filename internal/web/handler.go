@@ -349,6 +349,10 @@ func NewDashboardMux(fetcher ConvoyFetcher, webCfg *config.WebTimeoutsConfig) (h
 		webCfg = config.DefaultWebTimeoutsConfig()
 	}
 
+	// Wrap fetcher with caching to reduce Dolt server load from repeated subprocess invocations.
+	cacheTTL := config.ParseDurationOrDefault(webCfg.CacheTTL, 10*time.Second)
+	fetcher = NewCachingFetcher(fetcher, cacheTTL)
+
 	csrfToken := generateCSRFToken()
 
 	fetchTimeout := config.ParseDurationOrDefault(webCfg.FetchTimeout, 8*time.Second)

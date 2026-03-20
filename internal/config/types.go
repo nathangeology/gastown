@@ -129,6 +129,10 @@ type WebTimeoutsConfig struct {
 	DefaultRunTimeout string `json:"default_run_timeout,omitempty"`
 	// MaxRunTimeout is the maximum allowed timeout for /api/run commands. Default: "60s".
 	MaxRunTimeout string `json:"max_run_timeout,omitempty"`
+	// CacheTTL is how long dashboard fetch results are cached before re-fetching.
+	// Reduces Dolt server load from repeated subprocess invocations. Default: "10s".
+	// Set to "0" to disable caching.
+	CacheTTL string `json:"cache_ttl,omitempty"`
 }
 
 // DefaultWebTimeoutsConfig returns a WebTimeoutsConfig with sensible defaults.
@@ -140,6 +144,7 @@ func DefaultWebTimeoutsConfig() *WebTimeoutsConfig {
 		FetchTimeout:      "8s",
 		DefaultRunTimeout: "30s",
 		MaxRunTimeout:     "60s",
+		CacheTTL:          "10s",
 	}
 }
 
